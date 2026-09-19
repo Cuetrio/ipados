@@ -1,0 +1,22 @@
+# macOS Finder metadata
+.DS_Store
+
+# Xcode user state, DerivedData, and build artifacts
+UserInterfaceState.xcuserstate
+DerivedData/
+build/
+*.build/
+
+# Secrets, private keys, certificates, and provisioning profiles
+*.p12
+*.p8
+*.mobileprovision
+*.cer
+*.crt
+*.key
+
+# Local user data and SwiftData stores
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.store
