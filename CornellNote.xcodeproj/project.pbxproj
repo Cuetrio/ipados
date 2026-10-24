@@ -17,6 +17,13 @@
 		A00000000000000000000009 /* BackupEnvelope.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000018 /* BackupEnvelope.swift */; };
 		A0000000000000000000000A /* BackupInfrastructure.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000019 /* BackupInfrastructure.swift */; };
 		A0000000000000000000000B /* BackupRestore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000000000000000000001A /* BackupRestore.swift */; };
+		A0000000000000000000000C /* NoteStartupController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000000000000000000001B /* NoteStartupController.swift */; };
+		A0000000000000000000000D /* NoteEditingSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000000000000000000001C /* NoteEditingSession.swift */; };
+		A00000000000000000000090 /* BackupEnvelopeCodec.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000095 /* BackupEnvelopeCodec.swift */; };
+		A00000000000000000000091 /* BackupExport.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000096 /* BackupExport.swift */; };
+		A00000000000000000000092 /* BackupModelStoreSwitcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000097 /* BackupModelStoreSwitcher.swift */; };
+		A00000000000000000000093 /* RestoreMarkerStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000098 /* RestoreMarkerStore.swift */; };
+		A00000000000000000000094 /* LibraryBackupActions.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000099 /* LibraryBackupActions.swift */; };
 		A00000000000000000000007 /* CornellNoteTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000021 /* CornellNoteTests.swift */; };
 /* End PBXBuildFile section */
 
@@ -33,6 +40,13 @@
 		A00000000000000000000019 /* BackupInfrastructure.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupInfrastructure.swift; sourceTree = "<group>"; };
 		A0000000000000000000001A /* BackupRestore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupRestore.swift; sourceTree = "<group>"; };
 		A00000000000000000000020 /* CornellNoteTests.xctest */ = {isa = PBXFileReference; explicitFileType = "wrapper.cfbundle"; includeInIndex = 0; path = CornellNoteTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		A0000000000000000000001B /* NoteStartupController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NoteStartupController.swift; sourceTree = "<group>"; };
+		A0000000000000000000001C /* NoteEditingSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NoteEditingSession.swift; sourceTree = "<group>"; };
+		A00000000000000000000095 /* BackupEnvelopeCodec.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupEnvelopeCodec.swift; sourceTree = "<group>"; };
+		A00000000000000000000096 /* BackupExport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupExport.swift; sourceTree = "<group>"; };
+		A00000000000000000000097 /* BackupModelStoreSwitcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackupModelStoreSwitcher.swift; sourceTree = "<group>"; };
+		A00000000000000000000098 /* RestoreMarkerStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RestoreMarkerStore.swift; sourceTree = "<group>"; };
+		A00000000000000000000099 /* LibraryBackupActions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibraryBackupActions.swift; sourceTree = "<group>"; };
 		A00000000000000000000021 /* CornellNoteTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CornellNoteTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -43,7 +57,7 @@
 
 /* Begin PBXGroup section */
 		A00000000000000000000040 = {isa = PBXGroup; children = (A00000000000000000000041, A00000000000000000000042, A00000000000000000000043,); sourceTree = "<group>"; };
-		A00000000000000000000041 /* CornellNote */ = {isa = PBXGroup; children = (A00000000000000000000011, A00000000000000000000012, A00000000000000000000013, A00000000000000000000014, A00000000000000000000015, A00000000000000000000016, A00000000000000000000017, A00000000000000000000018, A00000000000000000000019, A0000000000000000000001A,); path = CornellNote; sourceTree = "<group>"; };
+		A00000000000000000000041 /* CornellNote */ = {isa = PBXGroup; children = (A00000000000000000000011, A00000000000000000000012, A00000000000000000000013, A00000000000000000000014, A00000000000000000000015, A00000000000000000000016, A00000000000000000000017, A00000000000000000000018, A00000000000000000000019, A0000000000000000000001A, A0000000000000000000001B, A0000000000000000000001C, A00000000000000000000095, A00000000000000000000096, A00000000000000000000097, A00000000000000000000098, A00000000000000000000099,); path = CornellNote; sourceTree = "<group>"; };
 		A00000000000000000000042 /* CornellNoteTests */ = {isa = PBXGroup; children = (A00000000000000000000021,); path = CornellNoteTests; sourceTree = "<group>"; };
 		A00000000000000000000043 /* Products */ = {isa = PBXGroup; children = (A00000000000000000000010, A00000000000000000000020,); name = Products; sourceTree = "<group>"; };
 /* End PBXGroup section */
@@ -63,7 +77,7 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
-		A00000000000000000000032 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A00000000000000000000001, A00000000000000000000002, A00000000000000000000003, A00000000000000000000004, A00000000000000000000005, A00000000000000000000006, A00000000000000000000008, A00000000000000000000009, A0000000000000000000000A, A0000000000000000000000B,); runOnlyForDeploymentPostprocessing = 0; };
+		A00000000000000000000032 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A00000000000000000000001, A00000000000000000000002, A00000000000000000000003, A00000000000000000000004, A00000000000000000000005, A00000000000000000000006, A00000000000000000000008, A00000000000000000000009, A0000000000000000000000A, A0000000000000000000000B, A0000000000000000000000C, A0000000000000000000000D, A00000000000000000000090, A00000000000000000000091, A00000000000000000000092, A00000000000000000000093, A00000000000000000000094,); runOnlyForDeploymentPostprocessing = 0; };
 		A00000000000000000000034 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A00000000000000000000007,); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXSourcesBuildPhase section */
 
@@ -76,10 +90,11 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin XCBuildConfiguration section */
-		A00000000000000000000080 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; ENABLE_TESTABILITY = YES; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; PRODUCT_BUNDLE_IDENTIFIER = com.cornellmethod.notebook.ipad.dev; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "2"; }; name = Debug; };
-		A00000000000000000000081 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; PRODUCT_BUNDLE_IDENTIFIER = com.cornellmethod.notebook.ipad.dev; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "2"; }; name = Release; };
-		A00000000000000000000082 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; PRODUCT_BUNDLE_IDENTIFIER = com.cornellmethod.notebook.ipad.dev.tests; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "2"; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/CornellNote.app/CornellNote"; }; name = Debug; };
-		A00000000000000000000083 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; PRODUCT_BUNDLE_IDENTIFIER = com.cornellmethod.notebook.ipad.dev.tests; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "2"; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/CornellNote.app/CornellNote"; }; name = Release; };
+		/* App and test targets have no App Intents; skip unused metadata extraction. */
+		A00000000000000000000080 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; ENABLE_TESTABILITY = YES; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LM_SKIP_METADATA_EXTRACTION = YES; PRODUCT_BUNDLE_IDENTIFIER = com.cornellmethod.notebook.ipad.dev; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "2"; }; name = Debug; };
+		A00000000000000000000081 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LM_SKIP_METADATA_EXTRACTION = YES; PRODUCT_BUNDLE_IDENTIFIER = com.cornellmethod.notebook.ipad.dev; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "2"; }; name = Release; };
+		A00000000000000000000082 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LM_SKIP_METADATA_EXTRACTION = YES; PRODUCT_BUNDLE_IDENTIFIER = com.cornellmethod.notebook.ipad.dev.tests; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "2"; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/CornellNote.app/CornellNote"; }; name = Debug; };
+		A00000000000000000000083 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; LM_SKIP_METADATA_EXTRACTION = YES; PRODUCT_BUNDLE_IDENTIFIER = com.cornellmethod.notebook.ipad.dev.tests; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "2"; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/CornellNote.app/CornellNote"; }; name = Release; };
 		A00000000000000000000084 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; }; name = Debug; };
 		A00000000000000000000085 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {ALWAYS_SEARCH_USER_PATHS = NO; }; name = Release; };
 /* End XCBuildConfiguration section */

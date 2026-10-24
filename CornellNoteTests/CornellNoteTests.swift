@@ -47,7 +47,7 @@ final class CornellNoteTests: XCTestCase {
         firstContext.insert(note)
         try firstContext.save()
 
-        let savedDrawing = PKDrawing()
+        let savedDrawing = nonemptyDrawing(offset: 0)
         try firstController.save(note: note, drawing: savedDrawing)
         let pointer = try XCTUnwrap(note.drawingFileName)
         let checksum = try XCTUnwrap(note.drawingChecksum)
@@ -85,7 +85,6 @@ final class CornellNoteTests: XCTestCase {
         let oldUpdatedAt = note.updatedAt
 
         fileSystem.corruptNextRead = true
-        note.title = "After"
         let failingController = NotePersistenceController(
             modelContext: context,
             fileSystem: fileSystem,
@@ -93,11 +92,12 @@ final class CornellNoteTests: XCTestCase {
             commitMetadata: { throw NotePersistenceError.metadataCommitFailed }
         )
 
-        XCTAssertThrowsError(try failingController.save(note: note, drawing: PKDrawing()))
+        XCTAssertThrowsError(try failingController.save(note: note, drawing: PKDrawing(), title: "After"))
+        XCTAssertEqual(note.title, "Before")
         XCTAssertEqual(note.drawingFileName, oldPointer)
         XCTAssertEqual(note.drawingChecksum, oldChecksum)
         XCTAssertEqual(note.updatedAt, oldUpdatedAt)
-        XCTAssertTrue(try fileSystem.fileExists(forRelativePath: try XCTUnwrap(oldPointer)))
+        XCTAssertTrue(fileSystem.fileExists(forRelativePath: try XCTUnwrap(oldPointer)))
     }
 
     func testCapacityFailureDoesNotDeleteActiveGeneration() throws {
@@ -116,7 +116,7 @@ final class CornellNoteTests: XCTestCase {
 
         XCTAssertThrowsError(try controller.save(note: note, drawing: PKDrawing()))
         XCTAssertEqual(note.drawingFileName, oldPointer)
-        XCTAssertTrue(try fileSystem.fileExists(forRelativePath: oldPointer))
+        XCTAssertTrue(fileSystem.fileExists(forRelativePath: oldPointer))
         XCTAssertFalse(fileSystem.didRemoveAnything)
     }
 
@@ -136,7 +136,7 @@ final class CornellNoteTests: XCTestCase {
 
         XCTAssertThrowsError(try controller.save(note: note, drawing: PKDrawing()))
         XCTAssertEqual(note.drawingFileName, oldPointer)
-        XCTAssertTrue(try fileSystem.fileExists(forRelativePath: oldPointer))
+        XCTAssertTrue(fileSystem.fileExists(forRelativePath: oldPointer))
     }
 
     func testTemporaryWriteFailurePreservesOldActiveGenerationAndMetadata() throws {
@@ -155,7 +155,7 @@ final class CornellNoteTests: XCTestCase {
 
         XCTAssertThrowsError(try controller.save(note: note, drawing: PKDrawing()))
         XCTAssertEqual(note.drawingFileName, oldPointer)
-        XCTAssertTrue(try fileSystem.fileExists(forRelativePath: oldPointer))
+        XCTAssertTrue(fileSystem.fileExists(forRelativePath: oldPointer))
     }
 
     func testCommitFailureLeavesOrphanForSafeCleanupWithoutDeletingActiveFile() throws {
@@ -184,9 +184,9 @@ final class CornellNoteTests: XCTestCase {
 
         XCTAssertThrowsError(try controller.save(note: note, drawing: PKDrawing()))
         XCTAssertEqual(note.drawingFileName, oldPointer)
-        XCTAssertTrue(try fileSystem.fileExists(forRelativePath: oldPointer))
+        XCTAssertTrue(fileSystem.fileExists(forRelativePath: oldPointer))
         controller.cleanupOrphans(for: note)
-        XCTAssertTrue(try fileSystem.fileExists(forRelativePath: oldPointer))
+        XCTAssertTrue(fileSystem.fileExists(forRelativePath: oldPointer))
     }
 
     func testLibraryDeleteRemovesMetadataGenerationsAndThumbnail() throws {
@@ -365,6 +365,9 @@ final class CornellNoteTests: XCTestCase {
 
         let decomposedPath = "drawings/11111111-1111-1111-1111-111111111111/e\u{301}-\(String(repeating: "0", count: 64)).drawing"
         XCTAssertThrowsError(try BackupPathValidator.validate(decomposedPath))
+        let composedPath = "drawings/11111111-1111-1111-1111-111111111111/\u{e9}-\(String(repeating: "0", count: 64)).drawing"
+        XCTAssertNoThrow(try BackupPathValidator.validate(composedPath))
+        XCTAssertNoThrow(try BackupPathValidator.validate("metadata.json"))
         XCTAssertThrowsError(try BackupPathValidator.validate("/metadata.json"))
         XCTAssertThrowsError(try BackupPathValidator.validate("drawings/11111111-1111-1111-1111-111111111111/../metadata.store"))
     }
@@ -747,6 +750,911 @@ final class CornellNoteTests: XCTestCase {
         XCTAssertNotNil(result.safetyBackupURL)
     }
 
+    // MARK: - Editing session and save/read safety
+
+    func testStrictLoadRejectsUnknownSchemaBeforeEmptyPointerAndPartialMetadata() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileSystem = LocalNoteFileSystem(rootURL: root)
+        let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
+        let context = ModelContext(container)
+        let note = NoteRecord(title: "Unchanged")
+        context.insert(note)
+        try context.save()
+        let controller = NotePersistenceController(modelContext: context, fileSystem: fileSystem)
+        XCTAssertTrue(try controller.loadDrawing(for: note).strokes.isEmpty)
+
+        note.drawingSchemaVersion = 99
+        XCTAssertThrowsError(try controller.loadDrawing(for: note)) { error in
+            guard case NotePersistenceError.unsupportedDrawingSchema = error else {
+                return XCTFail("Schema must be checked before the absent pointer: \(error)")
+            }
+        }
+        note.drawingSchemaVersion = 1
+        note.drawingFileName = "drawings/\(note.id.uuidString)/missing.drawing"
+        XCTAssertThrowsError(try controller.loadDrawing(for: note))
+        note.drawingFileName = nil
+        note.drawingChecksum = String(repeating: "0", count: 64)
+        XCTAssertThrowsError(try controller.loadDrawing(for: note))
+    }
+
+    func testEverySaveFailurePreservesCommittedTitleMetadataAndBytesThenRetries() throws {
+        for existing in [false, true] {
+            for failure in ["capacity", "write", "read", "checksum", "rename", "commit"] {
+                let root = try makeTemporaryDirectory()
+                defer { try? FileManager.default.removeItem(at: root) }
+                var committed: SavedNoteSnapshot!
+                do {
+                    let fileSystem = FaultInjectingFileSystem(rootURL: root)
+                    let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
+                    let context = ModelContext(container)
+                    context.autosaveEnabled = true
+                    let controller = NotePersistenceController(
+                        modelContext: context,
+                        fileSystem: fileSystem,
+                        clock: { Date(timeIntervalSince1970: 200) },
+                        commitMetadata: {
+                            XCTAssertFalse(context.autosaveEnabled, "Title and drawing metadata must share one explicit commit")
+                            if fileSystem.failMetadataCommit { throw NotePersistenceError.metadataCommitFailed }
+                            try context.save()
+                        }
+                    )
+                    let note = NoteRecord(title: "Committed", now: Date(timeIntervalSince1970: 10))
+                    context.insert(note)
+                    try context.save()
+                    if existing { try controller.save(note: note, drawing: nonemptyDrawing(offset: 0)) }
+                    let old = try SavedNoteSnapshot(note: note, root: root)
+                    let session = NoteEditingSession(note: note, persistence: controller)
+                    let draft = nonemptyDrawing(offset: 100)
+                    session.updateTitle("Draft")
+                    session.updateDrawing(draft)
+                    XCTAssertEqual(note.title, "Committed", "Draft must not enter an autosaving model")
+                    try context.save()
+                    try assertReopenedStore(root: root, equals: old)
+
+                    switch failure {
+                    case "capacity": fileSystem.availableCapacity = 0
+                    case "write": fileSystem.failNextWrite = true
+                    case "read": fileSystem.failNextTemporaryRead = true
+                    case "checksum": fileSystem.corruptNextTemporaryRead = true
+                    case "rename": fileSystem.failNextMove = true
+                    default: fileSystem.failMetadataCommit = true
+                    }
+                    session.flushSave()
+
+                    XCTAssertEqual(session.saveState, .saveFailed, failure)
+                    XCTAssertTrue(session.hasUnsavedChanges)
+                    XCTAssertNotNil(session.saveFailureMessage)
+                    XCTAssertEqual(session.titleDraft, "Draft")
+                    XCTAssertEqual(session.drawingDraft.dataRepresentation(), draft.dataRepresentation())
+                    XCTAssertEqual(try SavedNoteSnapshot(note: note, root: root), old, failure)
+                    XCTAssertTrue(context.autosaveEnabled)
+                    // A subsequent autosave/explicit context save must still commit only the old values.
+                    try context.save()
+                    try assertReopenedStore(root: root, equals: old)
+
+                    fileSystem.availableCapacity = .max
+                    fileSystem.failMetadataCommit = false
+                    session.flushSave()
+                    XCTAssertEqual(session.saveState, .saved)
+                    XCTAssertFalse(session.hasUnsavedChanges)
+                    XCTAssertNil(session.saveFailureMessage)
+                    XCTAssertEqual(note.title, "Draft")
+                    XCTAssertEqual(note.updatedAt, Date(timeIntervalSince1970: 200))
+                    XCTAssertEqual(note.drawingSchemaVersion, 1)
+                    XCTAssertEqual(try controller.loadDrawing(for: note).strokes.count, 1)
+                    XCTAssertEqual(try controller.loadDrawing(for: note).bounds, draft.bounds)
+                    committed = try SavedNoteSnapshot(note: note, root: root)
+                    XCTAssertNotEqual(committed.pointer, old.pointer)
+                    if let pointer = old.pointer {
+                        XCTAssertFalse(fileSystem.fileExists(at: root.appendingPathComponent(pointer)))
+                    }
+                }
+                // Reopen the actual disk store after the editing context/container have left scope.
+                try assertReopenedStore(root: root, equals: committed)
+            }
+        }
+    }
+
+    func testTitleOnlyEditCommitsWithVerifiedNonemptyDrawingAndReopens() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        var saved: SavedNoteSnapshot!
+        do {
+            let fileSystem = LocalNoteFileSystem(rootURL: root)
+            let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
+            let context = ModelContext(container)
+            let controller = NotePersistenceController(modelContext: context, fileSystem: fileSystem)
+            let note = NoteRecord(title: "Before")
+            context.insert(note)
+            try context.save()
+            try controller.save(note: note, drawing: nonemptyDrawing(offset: 0))
+            let original = try SavedNoteSnapshot(note: note, root: root)
+            let session = NoteEditingSession(note: note, persistence: controller)
+            session.updateTitle("Title only")
+            XCTAssertEqual(note.title, "Before")
+            XCTAssertTrue(session.requestLeave())
+            XCTAssertEqual(session.saveState, .saved)
+            saved = try SavedNoteSnapshot(note: note, root: root)
+            XCTAssertEqual(saved.title, "Title only")
+            let originalDrawing = try PKDrawing(data: XCTUnwrap(original.bytes))
+            let savedDrawing = try PKDrawing(data: XCTUnwrap(saved.bytes))
+            XCTAssertEqual(savedDrawing.strokes.count, originalDrawing.strokes.count)
+            XCTAssertEqual(savedDrawing.bounds, originalDrawing.bounds)
+            XCTAssertEqual(savedDrawing.strokes.first?.path.first?.location, originalDrawing.strokes.first?.path.first?.location)
+            XCTAssertNotEqual(saved.pointer, original.pointer)
+        }
+        try assertReopenedStore(root: root, equals: saved)
+    }
+
+    func testLoadFailuresBlockTitleDrawingAutosaveManualSaveAndLeaveWrites() async throws {
+        for failure in ["schema", "partialPointer", "partialChecksum", "path", "missing", "checksum", "decode"] {
+            let root = try makeTemporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: root) }
+            var unchanged: SavedNoteSnapshot!
+            do {
+                let fileSystem = FaultInjectingFileSystem(rootURL: root)
+                let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
+                let context = ModelContext(container)
+                let controller = NotePersistenceController(modelContext: context, fileSystem: fileSystem)
+                let note = NoteRecord(title: "Do not overwrite")
+                context.insert(note)
+                try context.save()
+                try controller.save(note: note, drawing: nonemptyDrawing(offset: 0))
+                let validPointer = try XCTUnwrap(note.drawingFileName)
+                let validBytes = try Data(contentsOf: root.appendingPathComponent(validPointer))
+                switch failure {
+                case "schema": note.drawingSchemaVersion = 99
+                case "partialPointer": note.drawingChecksum = nil
+                case "partialChecksum": note.drawingFileName = nil
+                case "path": note.drawingFileName = "drawings/../metadata.store"
+                case "missing": try FileManager.default.removeItem(at: root.appendingPathComponent(validPointer))
+                case "checksum": note.drawingChecksum = String(repeating: "0", count: 64)
+                default:
+                    let invalidBytes = Data("not a PKDrawing".utf8)
+                    try invalidBytes.write(to: root.appendingPathComponent(validPointer))
+                    note.drawingChecksum = invalidBytes.sha256HexForTest
+                }
+                try context.save()
+                unchanged = try SavedNoteSnapshot(note: note, root: root)
+                let generationURLs = try fileSystem.contentsOfDirectory(at: root.appendingPathComponent("drawings/\(note.id.uuidString)"))
+                let generationBytes = try generationURLs.map { try Data(contentsOf: $0) }
+                let sleeper = ControlledDebounceSleeper()
+                let session = NoteEditingSession(note: note, persistence: controller, waitForDebounce: sleeper.wait)
+                XCTAssertFalse(session.canEdit, failure)
+                XCTAssertNotNil(session.loadFailureMessage)
+                XCTAssertThrowsError(try controller.loadDrawing(for: note))
+                session.updateTitle("Forbidden")
+                session.updateDrawing(nonemptyDrawing(offset: 100))
+                session.flushSave()
+                XCTAssertTrue(session.requestLeave())
+                await Task.yield()
+                XCTAssertTrue(sleeper.delays.isEmpty, "Load failure must not schedule autosave")
+                XCTAssertFalse(session.hasUnsavedChanges)
+                XCTAssertEqual(session.titleDraft, "Do not overwrite")
+                XCTAssertEqual(try SavedNoteSnapshot(note: note, root: root), unchanged)
+                controller.cleanupOrphans(for: note) // Library also invokes cleanup before opening Editor.
+                XCTAssertEqual(try fileSystem.contentsOfDirectory(at: root.appendingPathComponent("drawings/\(note.id.uuidString)")).count, generationURLs.count)
+                XCTAssertEqual(try generationURLs.map { try Data(contentsOf: $0) }, generationBytes)
+                try assertReopenedStore(root: root, equals: unchanged)
+
+                // Retry uses the same record after the test fixture's corruption is repaired.
+                note.drawingSchemaVersion = 1
+                note.drawingFileName = validPointer
+                note.drawingChecksum = validBytes.sha256HexForTest
+                try validBytes.write(to: root.appendingPathComponent(validPointer))
+                try context.save()
+                session.reload()
+                XCTAssertTrue(session.canEdit)
+                XCTAssertNil(session.loadFailureMessage)
+                XCTAssertEqual(session.drawingDraft.strokes.count, 1)
+                unchanged = try SavedNoteSnapshot(note: note, root: root)
+            }
+            try assertReopenedStore(root: root, equals: unchanged)
+        }
+    }
+
+    func testDebounceUses450msCancelsPreviousEditsAndBackgroundFlushRetriesFailure() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileSystem = FaultInjectingFileSystem(rootURL: root)
+        let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
+        let context = ModelContext(container)
+        let controller = NotePersistenceController(modelContext: context, fileSystem: fileSystem)
+        let note = NoteRecord(title: "Original")
+        context.insert(note)
+        try context.save()
+        let sleeper = ControlledDebounceSleeper()
+        let session = NoteEditingSession(note: note, persistence: controller, waitForDebounce: sleeper.wait)
+        session.updateDrawing(nonemptyDrawing(offset: 0))
+        await sleeper.waitForCallCount(1)
+        session.updateTitle("Latest")
+        await sleeper.waitForCallCount(2)
+        XCTAssertEqual(sleeper.delays, [450_000_000, 450_000_000])
+        XCTAssertEqual(session.saveState, .unsavedChanges)
+        XCTAssertNil(note.drawingFileName)
+        sleeper.release(at: 0)
+        await Task.yield()
+        XCTAssertNil(note.drawingFileName, "Cancelled debounce must not save")
+        fileSystem.availableCapacity = 0
+        sleeper.release(at: 1)
+        for _ in 0..<100 where session.saveState != .saveFailed { await Task.yield() }
+        XCTAssertEqual(session.saveState, .saveFailed)
+        XCTAssertEqual(session.titleDraft, "Latest")
+        XCTAssertEqual(session.drawingDraft.strokes.count, 1)
+
+        fileSystem.availableCapacity = .max
+        session.flushSave() // Scene background calls this exact method, including from Save failed.
+        XCTAssertEqual(session.saveState, .saved)
+        XCTAssertEqual(note.title, "Latest")
+        try assertReopenedStore(root: root, equals: SavedNoteSnapshot(note: note, root: root))
+
+        session.updateTitle("Background before debounce")
+        await sleeper.waitForCallCount(3)
+        session.flushSave()
+        let pointer = note.drawingFileName
+        sleeper.release(at: 2)
+        await Task.yield()
+        XCTAssertEqual(note.title, "Background before debounce")
+        XCTAssertEqual(note.drawingFileName, pointer, "Background flush cancels pending timer")
+        try assertReopenedStore(root: root, equals: SavedNoteSnapshot(note: note, root: root))
+
+        session.updateDrawing(nonemptyDrawing(offset: 200))
+        await sleeper.waitForCallCount(4)
+        sleeper.release(at: 3)
+        for _ in 0..<100 where session.saveState != .saved { await Task.yield() }
+        XCTAssertEqual(session.saveState, .saved, "The latest debounce also saves without a manual flush")
+        XCTAssertFalse(session.hasUnsavedChanges)
+        XCTAssertEqual(try controller.loadDrawing(for: note).bounds, nonemptyDrawing(offset: 200).bounds)
+        try assertReopenedStore(root: root, equals: SavedNoteSnapshot(note: note, root: root))
+    }
+
+    func testLeaveFailureRetainsDraftUntilRetryOrExplicitWarnedDiscard() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileSystem = FaultInjectingFileSystem(rootURL: root)
+        let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
+        let context = ModelContext(container)
+        let controller = NotePersistenceController(modelContext: context, fileSystem: fileSystem)
+        let note = NoteRecord(title: "Old")
+        context.insert(note)
+        try context.save()
+        try controller.save(note: note, drawing: nonemptyDrawing(offset: 0))
+        let session = NoteEditingSession(note: note, persistence: controller)
+        XCTAssertFalse(session.confirmDiscard(), "Discard requires the leave loss warning first")
+        session.updateTitle("Retained")
+        session.updateDrawing(nonemptyDrawing(offset: 100))
+        fileSystem.availableCapacity = 0
+        XCTAssertFalse(session.requestLeave())
+        XCTAssertTrue(session.needsDiscardConfirmation)
+        XCTAssertEqual(session.titleDraft, "Retained")
+        XCTAssertEqual(session.drawingDraft.bounds, nonemptyDrawing(offset: 100).bounds)
+        session.cancelLeave()
+        XCTAssertFalse(session.needsDiscardConfirmation)
+        XCTAssertTrue(session.hasUnsavedChanges)
+        session.reload()
+        XCTAssertEqual(session.titleDraft, "Retained", "Reload must not discard an editable draft")
+        fileSystem.availableCapacity = .max
+        XCTAssertTrue(session.requestLeave())
+        XCTAssertEqual(note.title, "Retained")
+        let saved = try SavedNoteSnapshot(note: note, root: root)
+
+        session.updateTitle("Discard me")
+        session.updateDrawing(nonemptyDrawing(offset: 200))
+        fileSystem.availableCapacity = 0
+        XCTAssertFalse(session.requestLeave())
+        XCTAssertTrue(session.confirmDiscard())
+        XCTAssertFalse(session.hasUnsavedChanges)
+        XCTAssertEqual(session.titleDraft, "Retained")
+        XCTAssertEqual(try SavedNoteSnapshot(note: note, root: root), saved)
+        try assertReopenedStore(root: root, equals: saved)
+    }
+
+    // MARK: - Startup admission and generation revocation
+
+    func testStartupNormalAdmissionReadsMarkerBeforeCreatingContainer() throws {
+        for marker in [nil, RestoreMarker(recoveryRequired: false, safetyBackupPath: nil, lastFailureState: nil)] {
+            let root = try makeTemporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let markerStore = StartupRecordingMarkerStore()
+            markerStore.marker = marker
+            var events: [String] = []
+            markerStore.onRead = { events.append("read") }
+            let startup = NoteStartupController(markerStore: markerStore) {
+                events.append("open")
+                return try NotePersistenceController.makeContainer(fileSystem: LocalNoteFileSystem(rootURL: root), inMemory: true)
+            }
+            if case .checking = startup.state {} else { XCTFail("Initialization must not open the store") }
+            XCTAssertTrue(events.isEmpty)
+
+            startup.recheck()
+
+            if case .ready = startup.state {} else { XCTFail("Verified storage should open") }
+            XCTAssertEqual(events, ["read", "open"])
+            XCTAssertEqual(markerStore.writeCount, 0)
+        }
+    }
+
+    func testStartupRootRecoveryBlocksContainerAndPreservesAllFiles() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileSystem = try makeStartupFixture(root: root)
+        let marker = RestoreMarker(recoveryRequired: true, safetyBackupPath: "Backups/safety/safety-test", lastFailureState: "post-switch")
+        try fileSystem.writeAndFlush(try JSONEncoder().encode(marker), to: root.appendingPathComponent("restore-state.json"))
+        let before = try StartupFileSnapshot(root: root)
+        fileSystem.mutations.removeAll()
+        var opens = 0
+        let startup = NoteStartupController(markerStore: LocalRestoreMarkerStore(fileSystem: fileSystem)) {
+            opens += 1
+            throw BackupEnvelopeError.invalidMetadata
+        }
+
+        startup.recheck()
+        assertStartupBlocked(startup, by: .recoveryRequired)
+        startup.recheck() // Retry cannot clear the recovery marker.
+        assertStartupBlocked(startup, by: .recoveryRequired)
+
+        XCTAssertEqual(opens, 0)
+        XCTAssertEqual(try LocalRestoreMarkerStore(fileSystem: fileSystem).read(), marker)
+        XCTAssertEqual(try StartupFileSnapshot(root: root), before)
+        XCTAssertTrue(fileSystem.mutations.isEmpty)
+    }
+
+    func testStartupFallbackRecoveryOverridesMissingOrResolvedRoot() throws {
+        for hasRootMarker in [false, true] {
+            let root = try makeTemporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let fileSystem = try makeStartupFixture(root: root)
+            if hasRootMarker {
+                let resolved = RestoreMarker(recoveryRequired: false, safetyBackupPath: nil, lastFailureState: nil)
+                try fileSystem.writeAndFlush(try JSONEncoder().encode(resolved), to: root.appendingPathComponent("restore-state.json"))
+            }
+            let recovery = RestoreMarker(recoveryRequired: true, safetyBackupPath: "Backups/safety/safety-test", lastFailureState: "rollback")
+            try fileSystem.writeAndFlush(try JSONEncoder().encode(recovery), to: root.appendingPathComponent("Backups/safety/safety-test/recovery-state.json"))
+            let before = try StartupFileSnapshot(root: root)
+            fileSystem.mutations.removeAll()
+            var opens = 0
+            let markerStore = LocalRestoreMarkerStore(fileSystem: fileSystem)
+            let startup = NoteStartupController(markerStore: markerStore) {
+                opens += 1
+                throw BackupEnvelopeError.invalidMetadata
+            }
+
+            XCTAssertEqual(try markerStore.read(), recovery)
+            startup.recheck()
+            assertStartupBlocked(startup, by: .recoveryRequired)
+            XCTAssertEqual(opens, 0)
+            XCTAssertEqual(try StartupFileSnapshot(root: root), before)
+            XCTAssertTrue(fileSystem.mutations.isEmpty)
+        }
+    }
+
+    func testStartupCorruptAndUnknownRootAndFallbackMarkersFailClosed() throws {
+        let invalidMarkers = [
+            Data("not JSON".utf8),
+            Data("{\"schema\":99,\"recoveryRequired\":false}".utf8),
+            Data("{\"schema\":1,\"recoveryRequired\":\"false\"}".utf8)
+        ]
+        for path in ["restore-state.json", "Backups/safety/safety-test/recovery-state.json"] {
+            for data in invalidMarkers {
+                let root = try makeTemporaryDirectory()
+                defer { try? FileManager.default.removeItem(at: root) }
+                let fileSystem = try makeStartupFixture(root: root)
+                let resolved = RestoreMarker(recoveryRequired: false, safetyBackupPath: nil, lastFailureState: nil)
+                try fileSystem.writeAndFlush(try JSONEncoder().encode(resolved), to: root.appendingPathComponent("restore-state.json"))
+                try fileSystem.writeAndFlush(data, to: root.appendingPathComponent(path))
+                let before = try StartupFileSnapshot(root: root)
+                fileSystem.mutations.removeAll()
+                var opens = 0
+                let markerStore = LocalRestoreMarkerStore(fileSystem: fileSystem)
+                let startup = NoteStartupController(markerStore: markerStore) {
+                    opens += 1
+                    throw BackupEnvelopeError.invalidMetadata
+                }
+
+                XCTAssertThrowsError(try markerStore.read(), path)
+                startup.recheck()
+                assertStartupBlocked(startup, by: .safetyCheckFailed)
+                startup.recheck()
+                assertStartupBlocked(startup, by: .safetyCheckFailed)
+                XCTAssertEqual(opens, 0, path)
+                XCTAssertEqual(try StartupFileSnapshot(root: root), before)
+                XCTAssertTrue(fileSystem.mutations.isEmpty)
+            }
+        }
+    }
+
+    func testStartupRootAndFallbackReadFailuresDoNotTrustFileExists() throws {
+        for path in ["restore-state.json", "Backups/safety/safety-test/recovery-state.json"] {
+            for hidden in [false, true] {
+                let root = try makeTemporaryDirectory()
+                defer { try? FileManager.default.removeItem(at: root) }
+                let fileSystem = try makeStartupFixture(root: root)
+                let marker = RestoreMarker(recoveryRequired: false, safetyBackupPath: nil, lastFailureState: nil)
+                let url = root.appendingPathComponent(path)
+                try fileSystem.writeAndFlush(try JSONEncoder().encode(marker), to: url)
+                let before = try StartupFileSnapshot(root: root)
+                fileSystem.mutations.removeAll()
+                fileSystem.readFailures.insert(url)
+                if hidden { fileSystem.hiddenPaths.insert(url) }
+                var opens = 0
+                let startup = NoteStartupController(markerStore: LocalRestoreMarkerStore(fileSystem: fileSystem)) {
+                    opens += 1
+                    throw BackupEnvelopeError.invalidMetadata
+                }
+
+                startup.recheck()
+
+                assertStartupBlocked(startup, by: .safetyCheckFailed)
+                XCTAssertEqual(opens, 0)
+                XCTAssertEqual(try StartupFileSnapshot(root: root), before)
+                XCTAssertTrue(fileSystem.mutations.isEmpty)
+            }
+        }
+    }
+
+    func testStartupSafetyDirectoryListFailureBlocksMissingOrResolvedRoot() throws {
+        for hasRootMarker in [false, true] {
+            for hidden in [false, true] {
+                let root = try makeTemporaryDirectory()
+                defer { try? FileManager.default.removeItem(at: root) }
+                let fileSystem = try makeStartupFixture(root: root)
+                if hasRootMarker {
+                    let marker = RestoreMarker(recoveryRequired: false, safetyBackupPath: nil, lastFailureState: nil)
+                    try fileSystem.writeAndFlush(try JSONEncoder().encode(marker), to: root.appendingPathComponent("restore-state.json"))
+                }
+                let before = try StartupFileSnapshot(root: root)
+                fileSystem.mutations.removeAll()
+                let safetyRoot = BackupManagedPaths.safetyRoot(for: fileSystem)
+                fileSystem.directoryFailures.insert(safetyRoot)
+                if hidden { fileSystem.hiddenPaths.insert(safetyRoot) }
+                var opens = 0
+                let startup = NoteStartupController(markerStore: LocalRestoreMarkerStore(fileSystem: fileSystem)) {
+                    opens += 1
+                    throw BackupEnvelopeError.invalidMetadata
+                }
+
+                startup.recheck()
+
+                assertStartupBlocked(startup, by: .safetyCheckFailed)
+                XCTAssertEqual(opens, 0)
+                XCTAssertEqual(try StartupFileSnapshot(root: root), before)
+                XCTAssertTrue(fileSystem.mutations.isEmpty)
+            }
+        }
+    }
+
+    func testStartupConfirmedAbsenceAllowsFreshInstallWithoutCreatingFilesDuringCheck() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileSystem = StartupFaultFileSystem(rootURL: root.appendingPathComponent("not-created"))
+        let before = try StartupFileSnapshot(root: root)
+        var opens = 0
+        let startup = NoteStartupController(markerStore: LocalRestoreMarkerStore(fileSystem: fileSystem)) {
+            opens += 1
+            XCTAssertEqual(try StartupFileSnapshot(root: root), before, "Admission must not create the root")
+            return try NotePersistenceController.makeContainer(fileSystem: fileSystem, inMemory: true)
+        }
+
+        startup.recheck()
+
+        if case .ready = startup.state {} else { XCTFail("A confirmed absent root is a fresh install") }
+        XCTAssertEqual(opens, 1)
+        XCTAssertEqual(try StartupFileSnapshot(root: root), before)
+        XCTAssertTrue(fileSystem.mutations.isEmpty)
+    }
+
+    func testStartupResolvedFallbacksAndMarkerFreeSafetyBackupsAllowOpenUnchanged() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileSystem = try makeStartupFixture(root: root)
+        let resolved = RestoreMarker(recoveryRequired: false, safetyBackupPath: "Backups/safety/safety-test", lastFailureState: nil)
+        try fileSystem.writeAndFlush(try JSONEncoder().encode(resolved), to: root.appendingPathComponent("restore-state.json"))
+        try fileSystem.writeAndFlush(try JSONEncoder().encode(resolved), to: root.appendingPathComponent("Backups/safety/safety-test/recovery-state.json"))
+        try fileSystem.createDirectory(at: root.appendingPathComponent("Backups/safety/safety-without-marker"))
+        let before = try StartupFileSnapshot(root: root)
+        fileSystem.mutations.removeAll()
+        var opens = 0
+        let startup = NoteStartupController(markerStore: LocalRestoreMarkerStore(fileSystem: fileSystem)) {
+            opens += 1
+            return try NotePersistenceController.makeContainer(fileSystem: fileSystem, inMemory: true)
+        }
+
+        startup.recheck()
+
+        if case .ready = startup.state {} else { XCTFail("Resolved fallback markers should not block") }
+        XCTAssertEqual(opens, 1)
+        XCTAssertEqual(try StartupFileSnapshot(root: root), before)
+        XCTAssertTrue(fileSystem.mutations.isEmpty)
+    }
+
+    func testStartupStoreOpenFailureRetryAlwaysRepeatsAdmissionWithoutMutatingFiles() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileSystem = try makeStartupFixture(root: root)
+        let before = try StartupFileSnapshot(root: root)
+        fileSystem.mutations.removeAll()
+        let markerStore = StartupRecordingMarkerStore()
+        var events: [String] = []
+        markerStore.onRead = { events.append("read") }
+        var opens = 0
+        let startup = NoteStartupController(markerStore: markerStore) {
+            events.append("open")
+            opens += 1
+            if opens < 3 { throw BackupEnvelopeError.invalidMetadata }
+            return try NotePersistenceController.makeContainer(fileSystem: fileSystem, inMemory: true)
+        }
+
+        startup.recheck()
+        assertStartupBlocked(startup, by: .storeOpenFailed)
+        startup.recheck()
+        assertStartupBlocked(startup, by: .storeOpenFailed)
+        startup.recheck()
+        if case .ready = startup.state {} else { XCTFail("A successful retry should open verified storage") }
+
+        XCTAssertEqual(events, ["read", "open", "read", "open", "read", "open"])
+        XCTAssertEqual(markerStore.writeCount, 0)
+        XCTAssertEqual(try StartupFileSnapshot(root: root), before)
+        XCTAssertTrue(fileSystem.mutations.isEmpty)
+    }
+
+    func testStartupRetryCannotBypassNewRecoveryOrUnreadableMarker() throws {
+        let markerStore = StartupRecordingMarkerStore()
+        var opens = 0
+        let startup = NoteStartupController(markerStore: markerStore) {
+            opens += 1
+            throw BackupEnvelopeError.invalidMetadata
+        }
+        startup.recheck()
+        assertStartupBlocked(startup, by: .storeOpenFailed)
+
+        markerStore.marker = RestoreMarker(recoveryRequired: true, safetyBackupPath: "retained", lastFailureState: "rollback")
+        startup.recheck()
+        assertStartupBlocked(startup, by: .recoveryRequired)
+        markerStore.readError = BackupEnvelopeError.invalidManifest
+        startup.recheck()
+        assertStartupBlocked(startup, by: .safetyCheckFailed)
+
+        XCTAssertEqual(opens, 1)
+        XCTAssertEqual(markerStore.readCount, 3)
+        XCTAssertEqual(markerStore.writeCount, 0)
+    }
+
+    func testStartupRecheckDropsReadyContainerOnRecoveryReadOrOpenFailure() throws {
+        for failure in [NoteStartupFailure.recoveryRequired, .safetyCheckFailed, .storeOpenFailed] {
+            let root = try makeTemporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let fileSystem = try makeStartupFixture(root: root)
+            let before = try StartupFileSnapshot(root: root)
+            fileSystem.mutations.removeAll()
+            let markerStore = StartupRecordingMarkerStore()
+            var opens = 0
+            let startup = NoteStartupController(markerStore: markerStore) {
+                opens += 1
+                if opens > 1 { throw BackupEnvelopeError.invalidMetadata }
+                return try NotePersistenceController.makeContainer(fileSystem: fileSystem, inMemory: true)
+            }
+            markerStore.onRead = { [weak startup] in
+                guard let startup else { return XCTFail("Startup controller should still be alive") }
+                if case .checking = startup.state {} else { XCTFail("Discard the old ready state before reading markers") }
+            }
+            startup.recheck()
+            if case .ready = startup.state {} else { XCTFail("First open should succeed") }
+            switch failure {
+            case .recoveryRequired:
+                markerStore.marker = RestoreMarker(recoveryRequired: true, safetyBackupPath: "retained", lastFailureState: nil)
+            case .safetyCheckFailed:
+                markerStore.readError = BackupEnvelopeError.invalidManifest
+            case .storeOpenFailed:
+                break
+            }
+
+            startup.recheck() // The root's store-switch receiver uses this same entry point.
+
+            assertStartupBlocked(startup, by: failure)
+            XCTAssertEqual(opens, failure == .storeOpenFailed ? 2 : 1)
+            XCTAssertEqual(markerStore.readCount, 2)
+            XCTAssertEqual(markerStore.writeCount, 0)
+            XCTAssertEqual(try StartupFileSnapshot(root: root), before)
+            XCTAssertTrue(fileSystem.mutations.isEmpty)
+        }
+    }
+
+    func testStartupRetryAfterExternalMarkerRepairDoesNotPerformItsOwnRepair() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileSystem = try makeStartupFixture(root: root)
+        let markerURL = root.appendingPathComponent("restore-state.json")
+        try fileSystem.writeAndFlush(Data("corrupt marker".utf8), to: markerURL)
+        let corruptSnapshot = try StartupFileSnapshot(root: root)
+        fileSystem.mutations.removeAll()
+        var opens = 0
+        let startup = NoteStartupController(markerStore: LocalRestoreMarkerStore(fileSystem: fileSystem)) {
+            opens += 1
+            return try NotePersistenceController.makeContainer(fileSystem: fileSystem, inMemory: true)
+        }
+        startup.recheck()
+        assertStartupBlocked(startup, by: .safetyCheckFailed)
+        XCTAssertEqual(opens, 0)
+        XCTAssertEqual(try StartupFileSnapshot(root: root), corruptSnapshot)
+        XCTAssertTrue(fileSystem.mutations.isEmpty)
+
+        // Only the fixture repairs the marker; the retry action has no repair capability.
+        let resolved = RestoreMarker(recoveryRequired: false, safetyBackupPath: nil, lastFailureState: nil)
+        try fileSystem.writeAndFlush(try JSONEncoder().encode(resolved), to: markerURL)
+        let repairedSnapshot = try StartupFileSnapshot(root: root)
+        fileSystem.mutations.removeAll()
+        startup.recheck()
+
+        if case .ready = startup.state {} else { XCTFail("An externally repaired marker may pass a fresh check") }
+        XCTAssertEqual(opens, 1)
+        XCTAssertEqual(try StartupFileSnapshot(root: root), repairedSnapshot)
+        XCTAssertTrue(fileSystem.mutations.isEmpty)
+    }
+
+    func testStartupSuccessfulStoreSwitchGetsNewContainerIdentity() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileSystem = LocalNoteFileSystem(rootURL: root)
+        let markerStore = StartupRecordingMarkerStore()
+        let startup = NoteStartupController(markerStore: markerStore) {
+            try NotePersistenceController.makeContainer(fileSystem: fileSystem, inMemory: true)
+        }
+        startup.recheck()
+        guard case .ready(let first) = startup.state else { return XCTFail("First open should succeed") }
+
+        startup.recheck()
+
+        guard case .ready(let second) = startup.state else { return XCTFail("Second open should succeed") }
+        XCTAssertFalse(first.container === second.container, "Library identity must change with the container")
+        XCTAssertEqual(markerStore.readCount, 2)
+        XCTAssertEqual(markerStore.writeCount, 0)
+    }
+
+    func testStartupDisappearingKnownMarkerOrSafetyDirectoryIsNotConfirmedAbsence() throws {
+        for path in ["restore-state.json", "Backups/safety/safety-test/recovery-state.json", "Backups/safety"] {
+            let root = try makeTemporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let fileSystem = try makeStartupFixture(root: root)
+            let url = root.appendingPathComponent(path)
+            if path == "Backups/safety" {
+                fileSystem.directoryFailures.insert(BackupManagedPaths.safetyRoot(for: fileSystem))
+            } else {
+                let resolved = RestoreMarker(recoveryRequired: false, safetyBackupPath: nil, lastFailureState: nil)
+                try fileSystem.writeAndFlush(try JSONEncoder().encode(resolved), to: url)
+                fileSystem.readFailures.insert(url)
+            }
+            fileSystem.failure = NSError(domain: NSCocoaErrorDomain, code: NSFileReadNoSuchFileError)
+            let before = try StartupFileSnapshot(root: root)
+            fileSystem.mutations.removeAll()
+            var opens = 0
+            let startup = NoteStartupController(markerStore: LocalRestoreMarkerStore(fileSystem: fileSystem)) {
+                opens += 1
+                throw BackupEnvelopeError.invalidMetadata
+            }
+
+            startup.recheck()
+
+            assertStartupBlocked(startup, by: .safetyCheckFailed)
+            XCTAssertEqual(opens, 0)
+            XCTAssertEqual(try StartupFileSnapshot(root: root), before)
+            XCTAssertTrue(fileSystem.mutations.isEmpty)
+        }
+    }
+
+    func testStartupRevokesOldAdmissionBeforeMarkerReadAndCreatesNewGenerationOnlyAfterOpen() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let markerStore = StartupRecordingMarkerStore()
+        var oldAdmission: NoteWriteAdmission?
+        let startup = NoteStartupController(markerStore: markerStore) {
+            if let oldAdmission { XCTAssertFalse(oldAdmission.isAllowed) }
+            return try NotePersistenceController.makeContainer(fileSystem: LocalNoteFileSystem(rootURL: root), inMemory: true)
+        }
+        if case .checking = startup.state {} else { XCTFail("No generation should exist before checking") }
+        startup.recheck()
+        guard case .ready(let firstGeneration) = startup.state else { return XCTFail("First open should succeed") }
+        let first = firstGeneration.writeAdmission
+        XCTAssertTrue(first.isAllowed)
+        oldAdmission = first
+        markerStore.onRead = { [weak startup] in
+            guard let startup else { return XCTFail("Startup controller should still be alive") }
+            XCTAssertFalse(first.isAllowed, "Revoke before marker read or any view teardown")
+            if case .checking = startup.state {} else { XCTFail("Old Library must already be detached with no generation") }
+        }
+
+        startup.recheck()
+
+        guard case .ready(let secondGeneration) = startup.state else { return XCTFail("Second open should succeed") }
+        let second = secondGeneration.writeAdmission
+        XCTAssertTrue(second.isAllowed)
+        XCTAssertFalse(first === second)
+        XCTAssertFalse(first.isAllowed, "A successful recheck must never revive an old generation")
+        XCTAssertEqual(markerStore.readCount, 2)
+        XCTAssertEqual(markerStore.writeCount, 0)
+    }
+
+    func testStartupRecheckPermanentlyBlocksDirtyOldSessionTeardownTimerAndRetryWrites() async throws {
+        for failure in [NoteStartupFailure.recoveryRequired, .safetyCheckFailed, .storeOpenFailed] {
+            for timerOrder in ["timerFirst", "teardownFirst", "afterSuccessfulRetry"] {
+                let root = try makeTemporaryDirectory()
+                defer { try? FileManager.default.removeItem(at: root) }
+                let fileSystem = StartupFaultFileSystem(rootURL: root)
+                let markerURL = root.appendingPathComponent("restore-state.json")
+                let fallbackURL = root.appendingPathComponent("Backups/safety/safety-test/recovery-state.json")
+                let resolved = RestoreMarker(recoveryRequired: false, safetyBackupPath: nil, lastFailureState: nil)
+                try fileSystem.writeAndFlush(try JSONEncoder().encode(resolved), to: markerURL)
+                var opens = 0
+                var failOpen = false
+                let startup = NoteStartupController(markerStore: LocalRestoreMarkerStore(fileSystem: fileSystem)) {
+                    opens += 1
+                    if failOpen { throw BackupEnvelopeError.invalidMetadata }
+                    // Only the first generation uses the old disk store; retry is an isolated factory result.
+                    return try NotePersistenceController.makeContainer(fileSystem: fileSystem, inMemory: opens > 1)
+                }
+                startup.recheck()
+                guard case .ready(let generation) = startup.state else { return XCTFail("First open should succeed") }
+                let oldAdmission = generation.writeAdmission
+                let context = ModelContext(generation.container)
+                context.autosaveEnabled = true
+                var commits = 0
+                let persistence = NotePersistenceController(modelContext: context, fileSystem: fileSystem, commitMetadata: {
+                    commits += 1
+                    try context.save()
+                })
+                let note = NoteRecord(title: "Committed", now: Date(timeIntervalSince1970: 10))
+                context.insert(note)
+                try context.save()
+                try persistence.save(note: note, drawing: nonemptyDrawing(offset: 0))
+                let saved = try SavedNoteSnapshot(note: note, root: root)
+                let safetyURL = root.appendingPathComponent("Backups/safety/safety-test")
+                try fileSystem.writeAndFlush(Data("untouched safety metadata".utf8), to: safetyURL.appendingPathComponent("metadata.store"))
+                try fileSystem.writeAndFlush(try XCTUnwrap(saved.bytes), to: safetyURL.appendingPathComponent("drawings/old.drawing"))
+                try fileSystem.writeAndFlush(Data("complete".utf8), to: safetyURL.appendingPathComponent("safety-complete.json"))
+                let sleeper = ControlledDebounceSleeper()
+                let session = NoteEditingSession(
+                    note: note,
+                    persistence: persistence,
+                    canWrite: { oldAdmission.isAllowed },
+                    waitForDebounce: sleeper.wait
+                )
+                let draft = nonemptyDrawing(offset: 100)
+                session.updateTitle("Pending title")
+                session.updateDrawing(draft)
+                await sleeper.waitForCallCount(1)
+                XCTAssertTrue(session.canEdit)
+                XCTAssertTrue(session.hasUnsavedChanges)
+                XCTAssertEqual(note.title, "Committed")
+                switch failure {
+                case .recoveryRequired:
+                    let recovery = RestoreMarker(recoveryRequired: true, safetyBackupPath: "Backups/safety/safety-test", lastFailureState: "rollback")
+                    try fileSystem.writeAndFlush(try JSONEncoder().encode(recovery), to: markerURL)
+                case .safetyCheckFailed:
+                    try fileSystem.writeAndFlush(Data("corrupt fallback".utf8), to: fallbackURL)
+                case .storeOpenFailed:
+                    failOpen = true
+                }
+                let before = try StartupFileSnapshot(root: root)
+                fileSystem.mutations.removeAll()
+
+                startup.recheck()
+
+                assertStartupBlocked(startup, by: failure)
+                XCTAssertEqual(opens, failure == .storeOpenFailed ? 2 : 1)
+                // The blocked state has no container or admission payload.
+                XCTAssertFalse(oldAdmission.isAllowed)
+                XCTAssertFalse(session.canEdit)
+                if timerOrder == "timerFirst" {
+                    sleeper.release(at: 0) // Not cancelled: the admission guard must stop this autosave.
+                    await sleeper.waitForCompletionCount(1)
+                }
+                if timerOrder != "afterSuccessfulRetry" {
+                    session.flushSave() // Editor onDisappear / Library navigation flush.
+                    session.flushSave() // Background flush.
+                    session.flushSave() // Manual save retry.
+                    if timerOrder == "teardownFirst" {
+                        sleeper.release(at: 0)
+                        await sleeper.waitForCompletionCount(1)
+                    }
+                }
+                session.updateTitle("Forbidden title")
+                session.updateDrawing(nonemptyDrawing(offset: 200))
+                session.reload()
+                XCTAssertEqual(session.titleDraft, "Pending title")
+                XCTAssertEqual(session.drawingDraft.dataRepresentation(), draft.dataRepresentation())
+                XCTAssertTrue(session.hasUnsavedChanges)
+                XCTAssertEqual(commits, 1)
+                XCTAssertEqual(try SavedNoteSnapshot(note: note, root: root), saved)
+                XCTAssertEqual(try StartupFileSnapshot(root: root), before)
+                XCTAssertTrue(fileSystem.mutations.isEmpty)
+
+                // Only the fixture resolves the hazard. Neither recheck nor the editor repairs anything.
+                try fileSystem.writeAndFlush(try JSONEncoder().encode(resolved), to: markerURL)
+                if failure == .safetyCheckFailed {
+                    try fileSystem.writeAndFlush(try JSONEncoder().encode(resolved), to: fallbackURL)
+                }
+                failOpen = false
+                let beforeRetry = try StartupFileSnapshot(root: root)
+                fileSystem.mutations.removeAll()
+                startup.recheck()
+                guard case .ready(let newGeneration) = startup.state else { return XCTFail("Safe retry should succeed") }
+                let newAdmission = newGeneration.writeAdmission
+                XCTAssertTrue(newAdmission.isAllowed)
+                XCTAssertFalse(newAdmission === oldAdmission)
+                XCTAssertFalse(oldAdmission.isAllowed)
+                XCTAssertFalse(session.canEdit)
+                if timerOrder == "afterSuccessfulRetry" {
+                    sleeper.release(at: 0) // The old pending timer is still not cancelled, even after a new open.
+                    await sleeper.waitForCompletionCount(1)
+                }
+                session.updateTitle("Still forbidden")
+                session.updateDrawing(nonemptyDrawing(offset: 300))
+                session.flushSave()
+                XCTAssertFalse(session.requestLeave())
+                session.reload()
+                XCTAssertTrue(session.hasUnsavedChanges)
+                XCTAssertEqual(session.titleDraft, "Pending title")
+                XCTAssertEqual(session.drawingDraft.dataRepresentation(), draft.dataRepresentation())
+                XCTAssertEqual(commits, 1, "No old-context commit is permitted after revocation")
+                XCTAssertEqual(try SavedNoteSnapshot(note: note, root: root), saved)
+                XCTAssertEqual(try StartupFileSnapshot(root: root), beforeRetry)
+                XCTAssertTrue(fileSystem.mutations.isEmpty)
+                try assertReopenedStore(root: root, equals: saved)
+            }
+        }
+    }
+
+    // MARK: - Fixture and assertion helpers
+
+    private func assertStartupBlocked(_ startup: NoteStartupController, by failure: NoteStartupFailure, file: StaticString = #filePath, line: UInt = #line) {
+        guard case .blocked(let actual) = startup.state else {
+            return XCTFail("Unsafe storage must not retain a ready container", file: file, line: line)
+        }
+        XCTAssertEqual(actual, failure, file: file, line: line)
+    }
+
+    private func makeStartupFixture(root: URL) throws -> StartupFaultFileSystem {
+        let fileSystem = StartupFaultFileSystem(rootURL: root)
+        let files = [
+            "metadata.store", "metadata.store-wal", "metadata.store-shm",
+            "drawings/current/old.drawing", "thumbnails/current.png",
+            "Backups/safety/safety-test/metadata.store",
+            "Backups/safety/safety-test/drawings/current/old.drawing",
+            "Backups/safety/safety-test/safety-complete.json"
+        ]
+        for path in files {
+            try fileSystem.writeAndFlush(Data("unchanged: \(path)".utf8), to: root.appendingPathComponent(path))
+        }
+        return fileSystem
+    }
+
+    private func nonemptyDrawing(offset: CGFloat) -> PKDrawing {
+        let points = [CGPoint(x: 20 + offset, y: 30), CGPoint(x: 70 + offset, y: 90)]
+        let controlPoints = points.enumerated().map { index, point in
+            PKStrokePoint(location: point, timeOffset: Double(index) * 0.1, size: CGSize(width: 4, height: 4), opacity: 1, force: 1, azimuth: 0, altitude: .pi / 2)
+        }
+        let path = PKStrokePath(controlPoints: controlPoints, creationDate: Date(timeIntervalSince1970: 1))
+        return PKDrawing(strokes: [PKStroke(ink: PKInk(.pen, color: .black), path: path)])
+    }
+
+    private func assertReopenedStore(root: URL, equals snapshot: SavedNoteSnapshot, file: StaticString = #filePath, line: UInt = #line) throws {
+        let fileSystem = LocalNoteFileSystem(rootURL: root)
+        let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
+        let context = ModelContext(container)
+        context.autosaveEnabled = false
+        let records = try context.fetch(FetchDescriptor<NoteRecord>())
+        XCTAssertEqual(records.count, 1, file: file, line: line)
+        let reopened = try XCTUnwrap(records.first, file: file, line: line)
+        XCTAssertEqual(try SavedNoteSnapshot(note: reopened, root: root), snapshot, file: file, line: line)
+        if let bytes = snapshot.bytes, let drawing = try? PKDrawing(data: bytes) {
+            let loaded = try? NotePersistenceController(modelContext: context, fileSystem: fileSystem).loadDrawing(for: reopened)
+            if snapshot.schema == 1, snapshot.checksum == bytes.sha256HexForTest {
+                XCTAssertEqual(loaded?.strokes.count, drawing.strokes.count, file: file, line: line)
+                XCTAssertEqual(loaded?.bounds, drawing.bounds, file: file, line: line)
+            }
+        }
+    }
+
     private func makeSimpleBackupData(title: String) throws -> Data {
         let id = try XCTUnwrap(UUID(uuidString: "22222222-2222-2222-2222-222222222222"))
         let metadata = BackupMetadata(notes: [
@@ -839,9 +1747,152 @@ private extension Data {
     }
 }
 
+private struct StartupFileSnapshot: Equatable {
+    let paths: [String]
+    let files: [String: Data]
+
+    init(root: URL) throws {
+        paths = try FileManager.default.subpathsOfDirectory(atPath: root.path).sorted()
+        var files: [String: Data] = [:]
+        for path in paths {
+            let url = root.appendingPathComponent(path)
+            var isDirectory: ObjCBool = false
+            if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), !isDirectory.boolValue {
+                files[path] = try Data(contentsOf: url)
+            }
+        }
+        self.files = files
+    }
+}
+
+private final class StartupFaultFileSystem: LocalNoteFileSystem {
+    var readFailures: Set<URL> = []
+    var directoryFailures: Set<URL> = []
+    var hiddenPaths: Set<URL> = []
+    var failure = NSError(domain: NSCocoaErrorDomain, code: NSFileReadNoPermissionError)
+    var mutations: [String] = []
+
+    override func fileExists(at url: URL) -> Bool {
+        !hiddenPaths.contains(url) && super.fileExists(at: url)
+    }
+
+    override func readData(at url: URL) throws -> Data {
+        if readFailures.contains(url) { throw failure }
+        return try super.readData(at: url)
+    }
+
+    override func contentsOfDirectory(at url: URL) throws -> [URL] {
+        if directoryFailures.contains(url) { throw failure }
+        return try super.contentsOfDirectory(at: url)
+    }
+
+    override func createDirectory(at url: URL) throws {
+        mutations.append("create")
+        try super.createDirectory(at: url)
+    }
+
+    override func writeAndFlush(_ data: Data, to url: URL) throws {
+        mutations.append("write")
+        try super.writeAndFlush(data, to: url)
+    }
+
+    override func moveItem(at sourceURL: URL, to destinationURL: URL) throws {
+        mutations.append("move")
+        try super.moveItem(at: sourceURL, to: destinationURL)
+    }
+
+    override func removeItem(at url: URL) throws {
+        mutations.append("remove")
+        try super.removeItem(at: url)
+    }
+}
+
+private final class StartupRecordingMarkerStore: RestoreMarkerStore {
+    var marker: RestoreMarker?
+    var readError: Error?
+    var onRead: (() -> Void)?
+    private(set) var readCount = 0
+    private(set) var writeCount = 0
+
+    func read() throws -> RestoreMarker? {
+        readCount += 1
+        onRead?()
+        if let readError { throw readError }
+        return marker
+    }
+
+    func write(_ marker: RestoreMarker, fallbackDirectory: URL?) throws {
+        writeCount += 1
+        XCTFail("Startup must never write or resolve a restore marker")
+        throw BackupEnvelopeError.invalidManifest
+    }
+}
+
+private struct SavedNoteSnapshot: Equatable {
+    let id: UUID
+    let title: String
+    let createdAt: Date
+    let updatedAt: Date
+    let pointer: String?
+    let checksum: String?
+    let schema: Int
+    let bytes: Data?
+
+    @MainActor
+    init(note: NoteRecord, root: URL) throws {
+        id = note.id
+        title = note.title
+        createdAt = note.createdAt
+        updatedAt = note.updatedAt
+        pointer = note.drawingFileName
+        checksum = note.drawingChecksum
+        schema = note.drawingSchemaVersion
+        if let pointer,
+           pointer.hasPrefix("drawings/\(note.id.uuidString)/"),
+           !pointer.contains(".."),
+           FileManager.default.fileExists(atPath: root.appendingPathComponent(pointer).path) {
+            bytes = try Data(contentsOf: root.appendingPathComponent(pointer))
+        } else {
+            bytes = nil
+        }
+    }
+}
+
+@MainActor
+private final class ControlledDebounceSleeper {
+    private(set) var delays: [UInt64] = []
+    private(set) var completionCount = 0
+    private var continuations: [Int: CheckedContinuation<Void, Error>] = [:]
+
+    func wait(_ nanoseconds: UInt64) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            let index = delays.count
+            continuations[index] = continuation
+            delays.append(nanoseconds)
+        }
+        completionCount += 1
+    }
+
+    func waitForCompletionCount(_ count: Int) async {
+        for _ in 0..<100 where completionCount < count { await Task.yield() }
+        XCTAssertEqual(completionCount, count)
+    }
+
+    func waitForCallCount(_ count: Int) async {
+        for _ in 0..<100 where delays.count < count { await Task.yield() }
+        XCTAssertEqual(delays.count, count)
+    }
+
+    func release(at index: Int) {
+        continuations.removeValue(forKey: index)?.resume()
+    }
+}
+
 private final class FaultInjectingFileSystem: LocalNoteFileSystem {
     var availableCapacity: Int64 = .max
     var corruptNextRead = false
+    var failNextTemporaryRead = false
+    var corruptNextTemporaryRead = false
     var failNextWrite = false
     var failNextMove = false
     var failMetadataCommit = false
@@ -850,7 +1901,15 @@ private final class FaultInjectingFileSystem: LocalNoteFileSystem {
     override func availableCapacity(for url: URL) throws -> Int64 { availableCapacity }
 
     override func readData(at url: URL) throws -> Data {
+        if failNextTemporaryRead && url.pathExtension == "tmp" {
+            failNextTemporaryRead = false
+            throw NotePersistenceError.invalidDrawingData
+        }
         let data = try super.readData(at: url)
+        if corruptNextTemporaryRead && url.pathExtension == "tmp" {
+            corruptNextTemporaryRead = false
+            return data + Data([0xff])
+        }
         if corruptNextRead {
             corruptNextRead = false
             var corrupted = data

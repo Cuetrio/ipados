@@ -7,6 +7,7 @@ import UIKit
 enum NotePersistenceError: Error {
     case insufficientCapacity
     case invalidDrawingPath
+    case incompleteDrawingMetadata
     case checksumMismatch
     case unsupportedDrawingSchema
     case invalidDrawingData
@@ -103,7 +104,7 @@ class LocalNoteFileSystem: NoteFileSystem {
 
 @MainActor
 final class NotePersistenceController {
-    static let drawingSchemaVersion = 1
+    nonisolated static let drawingSchemaVersion = 1
 
     let modelContext: ModelContext
     let fileSystem: NoteFileSystem
@@ -137,7 +138,7 @@ final class NotePersistenceController {
         return try ModelContainer(for: schema, configurations: [configuration])
     }
 
-    func save(note: NoteRecord, drawing: PKDrawing) throws {
+    func save(note: NoteRecord, drawing: PKDrawing, title: String? = nil) throws {
         let data = drawing.dataRepresentation()
         let drawingDirectory = drawingsDirectory(for: note)
         try fileSystem.createDirectory(at: drawingDirectory)
@@ -161,10 +162,16 @@ final class NotePersistenceController {
             throw error
         }
 
+        // Drafts never touch the model before file validation. No autosave may split this commit.
+        let autosaveEnabled = modelContext.autosaveEnabled
+        modelContext.autosaveEnabled = false
+        defer { modelContext.autosaveEnabled = autosaveEnabled }
+        let oldTitle = note.title
         let oldFileName = note.drawingFileName
         let oldChecksum = note.drawingChecksum
         let oldSchemaVersion = note.drawingSchemaVersion
         let oldUpdatedAt = note.updatedAt
+        note.title = title ?? oldTitle
         note.drawingFileName = relativePath(for: finalURL)
         note.drawingChecksum = checksum
         note.drawingSchemaVersion = Self.drawingSchemaVersion
@@ -173,6 +180,7 @@ final class NotePersistenceController {
         do {
             try commitMetadata()
         } catch {
+            note.title = oldTitle
             note.drawingFileName = oldFileName
             note.drawingChecksum = oldChecksum
             note.drawingSchemaVersion = oldSchemaVersion
@@ -184,11 +192,14 @@ final class NotePersistenceController {
     }
 
     func loadDrawing(for note: NoteRecord) throws -> PKDrawing {
-        guard let fileName = note.drawingFileName, let expectedChecksum = note.drawingChecksum else {
-            return PKDrawing()
-        }
         guard note.drawingSchemaVersion == Self.drawingSchemaVersion else {
             throw NotePersistenceError.unsupportedDrawingSchema
+        }
+        if note.drawingFileName == nil && note.drawingChecksum == nil {
+            return PKDrawing()
+        }
+        guard let fileName = note.drawingFileName, let expectedChecksum = note.drawingChecksum else {
+            throw NotePersistenceError.incompleteDrawingMetadata
         }
         let fileURL = try managedDrawingURL(fileName: fileName, note: note)
         let data = try fileSystem.readData(at: fileURL)
@@ -229,6 +240,8 @@ final class NotePersistenceController {
     }
 
     func cleanupOrphans(for note: NoteRecord) {
+        // Invalid metadata must not turn the last good generation into a deletable orphan.
+        guard (try? loadDrawing(for: note)) != nil else { return }
         let directory = drawingsDirectory(for: note)
         guard let urls = try? fileSystem.contentsOfDirectory(at: directory) else { return }
         let activeName = note.drawingFileName?.split(separator: "/").last.map(String.init)
