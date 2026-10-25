@@ -882,9 +882,120 @@ final class CornellNoteTests: XCTestCase {
             XCTAssertEqual(savedDrawing.strokes.count, originalDrawing.strokes.count)
             XCTAssertEqual(savedDrawing.bounds, originalDrawing.bounds)
             XCTAssertEqual(savedDrawing.strokes.first?.path.first?.location, originalDrawing.strokes.first?.path.first?.location)
-            XCTAssertNotEqual(saved.pointer, original.pointer)
+            XCTAssertEqual(saved.pointer, original.pointer, "A title-only save keeps the verified drawing generation")
+            XCTAssertEqual(saved.checksum, original.checksum)
+            XCTAssertEqual(saved.bytes, original.bytes)
         }
         try assertReopenedStore(root: root, equals: saved)
+    }
+
+    func testTitleOnlySaveNeedsNoCapacityOrDrawingWriteAndRollsBackFailedCommit() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        var committed: SavedNoteSnapshot!
+        do {
+            let fileSystem = FaultInjectingFileSystem(rootURL: root)
+            let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
+            let context = ModelContext(container)
+            let controller = NotePersistenceController(
+                modelContext: context,
+                fileSystem: fileSystem,
+                clock: { Date(timeIntervalSince1970: 300) },
+                commitMetadata: {
+                    if fileSystem.failMetadataCommit { throw NotePersistenceError.metadataCommitFailed }
+                    try context.save()
+                }
+            )
+            let note = NoteRecord(title: "Before", now: Date(timeIntervalSince1970: 10))
+            context.insert(note)
+            try context.save()
+            try controller.save(note: note, drawing: nonemptyDrawing(offset: 0))
+            let original = try SavedNoteSnapshot(note: note, root: root)
+            let drawingDirectory = root.appendingPathComponent("drawings/\(note.id.uuidString)")
+            let originalFiles = try FileManager.default.contentsOfDirectory(atPath: drawingDirectory.path).sorted()
+            let session = NoteEditingSession(note: note, persistence: controller)
+
+            // A failed metadata commit restores the committed title and keeps the pointer.
+            session.updateTitle("Failed title")
+            fileSystem.failMetadataCommit = true
+            session.flushSave()
+            XCTAssertEqual(session.saveState, .saveFailed)
+            XCTAssertTrue(session.hasUnsavedChanges)
+            XCTAssertEqual(session.titleDraft, "Failed title")
+            XCTAssertEqual(try SavedNoteSnapshot(note: note, root: root), original)
+
+            // No capacity is needed and any drawing write would fail the save.
+            fileSystem.failMetadataCommit = false
+            fileSystem.availableCapacity = 0
+            fileSystem.failNextWrite = true
+            session.updateTitle("After")
+            session.flushSave()
+            XCTAssertEqual(session.saveState, .saved)
+            XCTAssertFalse(session.hasUnsavedChanges)
+            XCTAssertTrue(fileSystem.failNextWrite, "A title-only save must not write a drawing file")
+            committed = try SavedNoteSnapshot(note: note, root: root)
+            XCTAssertEqual(committed.title, "After")
+            XCTAssertEqual(committed.updatedAt, Date(timeIntervalSince1970: 300))
+            XCTAssertEqual(committed.pointer, original.pointer)
+            XCTAssertEqual(committed.checksum, original.checksum)
+            XCTAssertEqual(committed.bytes, original.bytes)
+            XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: drawingDirectory.path).sorted(), originalFiles)
+
+            // A later drawing edit still creates a new verified generation.
+            fileSystem.availableCapacity = .max
+            fileSystem.failNextWrite = false
+            session.updateDrawing(nonemptyDrawing(offset: 100))
+            session.flushSave()
+            XCTAssertEqual(session.saveState, .saved)
+            XCTAssertNotEqual(note.drawingFileName, original.pointer)
+            XCTAssertEqual(try controller.loadDrawing(for: note).bounds, nonemptyDrawing(offset: 100).bounds)
+            committed = try SavedNoteSnapshot(note: note, root: root)
+        }
+        try assertReopenedStore(root: root, equals: committed)
+    }
+
+    func testDrawingEchoIsNotDirtyAndRealEditsSkipSerialization() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileSystem = LocalNoteFileSystem(rootURL: root)
+        let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
+        let context = ModelContext(container)
+        let controller = NotePersistenceController(modelContext: context, fileSystem: fileSystem)
+        let note = NoteRecord(title: "Large")
+        context.insert(note)
+        try context.save()
+        let large = largeDrawing(strokeCount: 2000)
+        try controller.save(note: note, drawing: large)
+        let session = NoteEditingSession(note: note, persistence: controller)
+
+        // Programmatic assignment echoes the loaded value, possibly as a decoded copy.
+        session.updateDrawing(session.drawingDraft)
+        session.updateDrawing(try PKDrawing(data: session.drawingDraft.dataRepresentation()))
+        XCTAssertFalse(session.hasUnsavedChanges, "Re-assigning the same drawing must not mark it dirty")
+
+        var appended = session.drawingDraft
+        appended.strokes.append(contentsOf: nonemptyDrawing(offset: 900).strokes)
+        XCTAssertTrue(NoteEditingSession.differs(appended, from: session.drawingDraft))
+        var erased = session.drawingDraft
+        erased.strokes.removeLast()
+        XCTAssertTrue(NoteEditingSession.differs(erased, from: session.drawingDraft))
+
+        // The stroke-count path must cost far less than the two full serializations it replaces.
+        let clock = ContinuousClock()
+        let fastPath = clock.measure {
+            for _ in 0..<20 { _ = NoteEditingSession.differs(appended, from: session.drawingDraft) }
+        }
+        let serialization = clock.measure {
+            for _ in 0..<20 { _ = appended.dataRepresentation() != session.drawingDraft.dataRepresentation() }
+        }
+        print("Drawing change detection for 2000 strokes x20: fast path \(fastPath), serialization \(serialization)")
+        XCTAssertLessThan(fastPath * 5, serialization)
+
+        session.updateDrawing(appended)
+        XCTAssertTrue(session.hasUnsavedChanges)
+        session.flushSave()
+        XCTAssertEqual(session.saveState, .saved)
+        XCTAssertEqual(try controller.loadDrawing(for: note).strokes.count, 2001)
     }
 
     func testLoadFailuresBlockTitleDrawingAutosaveManualSaveAndLeaveWrites() async throws {
@@ -1701,6 +1812,26 @@ final class CornellNoteTests: XCTestCase {
         }
         let path = PKStrokePath(controlPoints: controlPoints, creationDate: Date(timeIntervalSince1970: 1))
         return PKDrawing(strokes: [PKStroke(ink: PKInk(.pen, color: .black), path: path)])
+    }
+
+    private func largeDrawing(strokeCount: Int) -> PKDrawing {
+        let strokes = (0..<strokeCount).map { index -> PKStroke in
+            let origin = CGPoint(x: CGFloat(index % 40) * 25, y: CGFloat(index / 40) * 18)
+            let controlPoints = (0..<24).map { step in
+                PKStrokePoint(
+                    location: CGPoint(x: origin.x + CGFloat(step), y: origin.y + CGFloat(step % 6)),
+                    timeOffset: Double(step) * 0.01,
+                    size: CGSize(width: 3, height: 3),
+                    opacity: 1,
+                    force: 1,
+                    azimuth: 0,
+                    altitude: .pi / 2
+                )
+            }
+            let path = PKStrokePath(controlPoints: controlPoints, creationDate: Date(timeIntervalSince1970: 1))
+            return PKStroke(ink: PKInk(.pen, color: .black), path: path)
+        }
+        return PKDrawing(strokes: strokes)
     }
 
     private func assertReopenedStore(root: URL, equals snapshot: SavedNoteSnapshot, file: StaticString = #filePath, line: UInt = #line) throws {

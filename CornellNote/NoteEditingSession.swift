@@ -10,6 +10,8 @@ final class NoteEditingSession {
     var canEdit: Bool { canWrite() && loadState == .loaded }
     private var loadState: DrawingLoadState = .notLoaded
     private(set) var hasUnsavedChanges = false
+    /// Only drawing edits need a new drawing generation; title-only saves keep the active one.
+    private var hasUnsavedDrawing = false
     private(set) var saveState: NoteSaveState = .saved
     var loadFailureMessage: String? {
         guard case .failed(let message) = loadState else { return nil }
@@ -71,9 +73,20 @@ final class NoteEditingSession {
     }
 
     func updateDrawing(_ drawing: PKDrawing) {
-        guard canEdit, drawing.dataRepresentation() != drawingDraft.dataRepresentation() else { return }
+        guard canEdit, Self.differs(drawing, from: drawingDraft) else { return }
         drawingDraft = drawing
+        hasUnsavedDrawing = true
         markUnsavedAndSchedule()
+    }
+
+    /// A stroke count or bounds difference proves a real edit without serializing the drawing.
+    /// Only drawings that match on both, such as the echo of a programmatic assignment,
+    /// need the exact byte comparison.
+    static func differs(_ drawing: PKDrawing, from current: PKDrawing) -> Bool {
+        if drawing.strokes.count != current.strokes.count || drawing.bounds != current.bounds {
+            return true
+        }
+        return drawing.dataRepresentation() != current.dataRepresentation()
     }
 
     func flushSave() {
@@ -82,8 +95,13 @@ final class NoteEditingSession {
         guard canEdit, hasUnsavedChanges else { return }
         saveState = .saving
         do {
-            try persistence.save(note: note, drawing: drawingDraft, title: titleDraft)
+            if hasUnsavedDrawing {
+                try persistence.save(note: note, drawing: drawingDraft, title: titleDraft)
+            } else {
+                try persistence.saveTitle(note: note, title: titleDraft)
+            }
             hasUnsavedChanges = false
+            hasUnsavedDrawing = false
             saveFailureMessage = nil
             saveState = .saved
         } catch {
@@ -106,6 +124,7 @@ final class NoteEditingSession {
         guard needsDiscardConfirmation else { return false }
         saveTask?.cancel()
         hasUnsavedChanges = false
+        hasUnsavedDrawing = false
         needsDiscardConfirmation = false
         reload()
         return true

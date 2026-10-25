@@ -200,6 +200,29 @@ final class NotePersistenceController {
         cleanupOrphans(for: note)
     }
 
+    /// Commits a title change while keeping the verified active drawing generation.
+    /// No drawing bytes are serialized, written, or copied, so no capacity is required.
+    func saveTitle(note: NoteRecord, title: String) throws {
+        guard note.drawingSchemaVersion == Self.drawingSchemaVersion else {
+            throw NotePersistenceError.unsupportedDrawingSchema
+        }
+        let autosaveEnabled = modelContext.autosaveEnabled
+        modelContext.autosaveEnabled = false
+        defer { modelContext.autosaveEnabled = autosaveEnabled }
+        let oldTitle = note.title
+        let oldUpdatedAt = note.updatedAt
+        note.title = title
+        note.updatedAt = clock()
+
+        do {
+            try commitMetadata()
+        } catch {
+            note.title = oldTitle
+            note.updatedAt = oldUpdatedAt
+            throw NotePersistenceError.metadataCommitFailed
+        }
+    }
+
     func loadDrawing(for note: NoteRecord) throws -> PKDrawing {
         guard note.drawingSchemaVersion == Self.drawingSchemaVersion else {
             throw NotePersistenceError.unsupportedDrawingSchema
