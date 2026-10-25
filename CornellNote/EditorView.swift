@@ -5,9 +5,10 @@ struct EditorView: View {
     @Environment(\.scenePhase) private var scenePhase
     let session: NoteEditingSession
     let onLeave: () -> Void
-    @State private var canvasView = PKCanvasView()
-    @State private var selectedTool: PKTool = PKInkingTool(.pen, color: .label, width: 3)
+    @State private var canvasView = NoteCanvasView()
     @State private var isShowingLeaveWarning = false
+    @State private var canUndo = false
+    @State private var canRedo = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -27,7 +28,7 @@ struct EditorView: View {
                 } actions: {
                     Button("再読み込み") {
                         session.reload()
-                        canvasView.drawing = session.drawingDraft
+                        showLoadedDrawing()
                     }
                 }
             } else {
@@ -49,8 +50,9 @@ struct EditorView: View {
                 GeometryReader { proxy in
                     ZStack {
                         CornellBackgroundView()
-                        CanvasView(canvasView: $canvasView, selectedTool: selectedTool) { drawing in
+                        CanvasView(canvasView: canvasView, isEditable: session.canEdit) { drawing in
                             session.updateDrawing(drawing)
+                            refreshHistoryState()
                         }
                     }
                     .padding()
@@ -67,14 +69,20 @@ struct EditorView: View {
                 Button(action: requestLeave) {
                     Label("ライブラリ", systemImage: "chevron.backward")
                 }
-                Button("ペン") {
-                    selectedTool = PKInkingTool(.pen, color: .label, width: 3)
+                Button {
+                    canvasView.undoManager?.undo()
+                    refreshHistoryState()
+                } label: {
+                    Label("取り消す", systemImage: "arrow.uturn.backward")
                 }
-                .disabled(!session.canEdit)
-                Button("消しゴム") {
-                    selectedTool = PKEraserTool(.vector)
+                .disabled(!session.canEdit || !canUndo)
+                Button {
+                    canvasView.undoManager?.redo()
+                    refreshHistoryState()
+                } label: {
+                    Label("やり直す", systemImage: "arrow.uturn.forward")
                 }
-                .disabled(!session.canEdit)
+                .disabled(!session.canEdit || !canRedo)
             }
             ToolbarItemGroup(placement: .topBarTrailing) {
                 Button("保存") { session.flushSave() }
@@ -95,9 +103,7 @@ struct EditorView: View {
         } message: {
             Text("保存に失敗しました。戻ると未保存のタイトルと描画が失われます。端末の空き容量を確認して再試行するか、編集を続けてください。")
         }
-        .onAppear {
-            canvasView.drawing = session.drawingDraft
-        }
+        .onAppear(perform: showLoadedDrawing)
         .onChange(of: scenePhase) { _, phase in
             if phase == .background { session.flushSave() }
         }
@@ -105,6 +111,18 @@ struct EditorView: View {
             // Library retains the session if an unexpected navigation still leaves an unsaved draft.
             session.flushSave()
         }
+    }
+
+    /// Shows the persisted drawing; loading is not an edit, so the drawing history starts empty.
+    private func showLoadedDrawing() {
+        canvasView.drawing = session.drawingDraft
+        canvasView.undoManager?.removeAllActions()
+        refreshHistoryState()
+    }
+
+    private func refreshHistoryState() {
+        canUndo = canvasView.undoManager?.canUndo ?? false
+        canRedo = canvasView.undoManager?.canRedo ?? false
     }
 
     private func requestLeave() {
