@@ -7,6 +7,7 @@ import UIKit
 enum NotePersistenceError: Error {
     case insufficientCapacity
     case invalidDrawingPath
+    case incompleteDrawingMetadata
     case checksumMismatch
     case unsupportedDrawingSchema
     case invalidDrawingData
@@ -36,6 +37,8 @@ protocol NoteFileSystem: AnyObject {
     func writeAndFlush(_ data: Data, to url: URL) throws
     func readData(at url: URL) throws -> Data
     func moveItem(at sourceURL: URL, to destinationURL: URL) throws
+    /// Atomically replaces any existing destination; the destination is never absent.
+    func replaceItem(at destinationURL: URL, withItemAt sourceURL: URL) throws
     func removeItem(at url: URL) throws
     func contentsOfDirectory(at url: URL) throws -> [URL]
     func fileExists(at url: URL) -> Bool
@@ -87,6 +90,13 @@ class LocalNoteFileSystem: NoteFileSystem {
         try fileManager.moveItem(at: sourceURL, to: destinationURL)
     }
 
+    func replaceItem(at destinationURL: URL, withItemAt sourceURL: URL) throws {
+        // rename(2) swaps the directory entry in one step on the same volume.
+        guard rename(sourceURL.path, destinationURL.path) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+    }
+
     func removeItem(at url: URL) throws {
         guard fileManager.fileExists(atPath: url.path) else { return }
         try fileManager.removeItem(at: url)
@@ -103,7 +113,7 @@ class LocalNoteFileSystem: NoteFileSystem {
 
 @MainActor
 final class NotePersistenceController {
-    static let drawingSchemaVersion = 1
+    nonisolated static let drawingSchemaVersion = 1
 
     let modelContext: ModelContext
     let fileSystem: NoteFileSystem
@@ -137,7 +147,7 @@ final class NotePersistenceController {
         return try ModelContainer(for: schema, configurations: [configuration])
     }
 
-    func save(note: NoteRecord, drawing: PKDrawing) throws {
+    func save(note: NoteRecord, drawing: PKDrawing, title: String? = nil) throws {
         let data = drawing.dataRepresentation()
         let drawingDirectory = drawingsDirectory(for: note)
         try fileSystem.createDirectory(at: drawingDirectory)
@@ -161,10 +171,16 @@ final class NotePersistenceController {
             throw error
         }
 
+        // Drafts never touch the model before file validation. No autosave may split this commit.
+        let autosaveEnabled = modelContext.autosaveEnabled
+        modelContext.autosaveEnabled = false
+        defer { modelContext.autosaveEnabled = autosaveEnabled }
+        let oldTitle = note.title
         let oldFileName = note.drawingFileName
         let oldChecksum = note.drawingChecksum
         let oldSchemaVersion = note.drawingSchemaVersion
         let oldUpdatedAt = note.updatedAt
+        note.title = title ?? oldTitle
         note.drawingFileName = relativePath(for: finalURL)
         note.drawingChecksum = checksum
         note.drawingSchemaVersion = Self.drawingSchemaVersion
@@ -173,6 +189,7 @@ final class NotePersistenceController {
         do {
             try commitMetadata()
         } catch {
+            note.title = oldTitle
             note.drawingFileName = oldFileName
             note.drawingChecksum = oldChecksum
             note.drawingSchemaVersion = oldSchemaVersion
@@ -183,12 +200,38 @@ final class NotePersistenceController {
         cleanupOrphans(for: note)
     }
 
-    func loadDrawing(for note: NoteRecord) throws -> PKDrawing {
-        guard let fileName = note.drawingFileName, let expectedChecksum = note.drawingChecksum else {
-            return PKDrawing()
-        }
+    /// Commits a title change while keeping the verified active drawing generation.
+    /// No drawing bytes are serialized, written, or copied, so no capacity is required.
+    func saveTitle(note: NoteRecord, title: String) throws {
         guard note.drawingSchemaVersion == Self.drawingSchemaVersion else {
             throw NotePersistenceError.unsupportedDrawingSchema
+        }
+        let autosaveEnabled = modelContext.autosaveEnabled
+        modelContext.autosaveEnabled = false
+        defer { modelContext.autosaveEnabled = autosaveEnabled }
+        let oldTitle = note.title
+        let oldUpdatedAt = note.updatedAt
+        note.title = title
+        note.updatedAt = clock()
+
+        do {
+            try commitMetadata()
+        } catch {
+            note.title = oldTitle
+            note.updatedAt = oldUpdatedAt
+            throw NotePersistenceError.metadataCommitFailed
+        }
+    }
+
+    func loadDrawing(for note: NoteRecord) throws -> PKDrawing {
+        guard note.drawingSchemaVersion == Self.drawingSchemaVersion else {
+            throw NotePersistenceError.unsupportedDrawingSchema
+        }
+        if note.drawingFileName == nil && note.drawingChecksum == nil {
+            return PKDrawing()
+        }
+        guard let fileName = note.drawingFileName, let expectedChecksum = note.drawingChecksum else {
+            throw NotePersistenceError.incompleteDrawingMetadata
         }
         let fileURL = try managedDrawingURL(fileName: fileName, note: note)
         let data = try fileSystem.readData(at: fileURL)
@@ -229,6 +272,8 @@ final class NotePersistenceController {
     }
 
     func cleanupOrphans(for note: NoteRecord) {
+        // Invalid metadata must not turn the last good generation into a deletable orphan.
+        guard (try? loadDrawing(for: note)) != nil else { return }
         let directory = drawingsDirectory(for: note)
         guard let urls = try? fileSystem.contentsOfDirectory(at: directory) else { return }
         let activeName = note.drawingFileName?.split(separator: "/").last.map(String.init)
