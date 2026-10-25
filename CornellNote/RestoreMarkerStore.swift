@@ -124,10 +124,8 @@ final class LocalRestoreMarkerStore: RestoreMarkerStore {
         guard readBack == data, let decoded = try? decode(readBack), decoded.schema == RestoreMarker.schema else {
             throw BackupEnvelopeError.footerHashMismatch
         }
-        if fileSystem.fileExists(at: destinationURL) {
-            try fileSystem.removeItem(at: destinationURL)
-        }
-        try fileSystem.moveItem(at: temporaryURL, to: destinationURL)
+        // Never delete first: an interrupted update must leave the previous marker readable.
+        try fileSystem.replaceItem(at: destinationURL, withItemAt: temporaryURL)
     }
 
     private func decode(_ data: Data) throws -> RestoreMarker {

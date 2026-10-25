@@ -1100,6 +1100,72 @@ final class CornellNoteTests: XCTestCase {
         XCTAssertTrue(fileSystem.mutations.isEmpty)
     }
 
+    func testInterruptedRecoveryMarkerRewriteKeepsStartupBlockedWithoutFallback() throws {
+        let marker = RestoreMarker(recoveryRequired: true, safetyBackupPath: "Backups/safety/safety-test", lastFailureState: "post-switch")
+        let rewrite = RestoreMarker(recoveryRequired: true, safetyBackupPath: "Backups/safety/safety-test", lastFailureState: "rollback")
+        for crashPoint in MarkerCrashPoint.allCases {
+            let root = try makeTemporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let fixture = try makeStartupFixture(root: root)
+            let markerURL = root.appendingPathComponent("restore-state.json")
+            let safetyURL = root.appendingPathComponent("Backups/safety/safety-test", isDirectory: true)
+            try LocalRestoreMarkerStore(fileSystem: fixture).write(marker, fallbackDirectory: safetyURL)
+            XCTAssertFalse(fixture.fileExists(at: safetyURL.appendingPathComponent("recovery-state.json")), "A successful root write leaves no fallback marker")
+            let dataBefore = try StartupFileSnapshot(root: root).files.filter { $0.key != "restore-state.json" }
+
+            let crashing = MarkerCrashFileSystem(rootURL: root, crashPoint: crashPoint)
+            XCTAssertThrowsError(try LocalRestoreMarkerStore(fileSystem: crashing).write(rewrite, fallbackDirectory: safetyURL), "\(crashPoint)")
+            XCTAssertTrue(crashing.crashed, "\(crashPoint)")
+            XCTAssertFalse(crashing.removedURLs.contains(markerURL), "The previous marker must never be deleted: \(crashPoint)")
+
+            // Restart with an ordinary file system.
+            let restarted = LocalNoteFileSystem(rootURL: root)
+            let survivor = try XCTUnwrap(try LocalRestoreMarkerStore(fileSystem: restarted).read(), "\(crashPoint)")
+            XCTAssertTrue(survivor.recoveryRequired, "\(crashPoint)")
+            XCTAssertEqual(survivor, crashPoint == .afterReplace ? rewrite : marker, "\(crashPoint)")
+            var opens = 0
+            let startup = NoteStartupController(markerStore: LocalRestoreMarkerStore(fileSystem: restarted)) {
+                opens += 1
+                throw BackupEnvelopeError.invalidMetadata
+            }
+            startup.recheck()
+            assertStartupBlocked(startup, by: .recoveryRequired)
+            XCTAssertEqual(opens, 0, "\(crashPoint)")
+            let dataAfter = try StartupFileSnapshot(root: root).files.filter {
+                $0.key != "restore-state.json" && !$0.key.hasSuffix(".tmp")
+            }
+            XCTAssertEqual(dataAfter, dataBefore, "Current data and safety backup must be unchanged: \(crashPoint)")
+        }
+    }
+
+    func testResolvedMarkerReplacementReopensNormallyWithoutDeletingFirst() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try makeStartupFixture(root: root)
+        let markerURL = root.appendingPathComponent("restore-state.json")
+        let required = RestoreMarker(recoveryRequired: true, safetyBackupPath: "Backups/safety/safety-test", lastFailureState: "post-switch")
+        let resolved = RestoreMarker(recoveryRequired: false, safetyBackupPath: nil, lastFailureState: nil)
+        try LocalRestoreMarkerStore(fileSystem: fixture).write(required, fallbackDirectory: nil)
+        fixture.mutations.removeAll()
+
+        try LocalRestoreMarkerStore(fileSystem: fixture).write(resolved, fallbackDirectory: nil)
+
+        // The replacement happens before any removal; the trailing remove is the
+        // no-op cleanup of the already consumed temporary file.
+        XCTAssertEqual(fixture.mutations.filter { $0 != "create" }, ["write", "replace", "remove"])
+        XCTAssertTrue(fixture.fileExists(at: markerURL))
+        XCTAssertEqual(try LocalRestoreMarkerStore(fileSystem: fixture).read(), resolved)
+        XCTAssertFalse(try FileManager.default.contentsOfDirectory(atPath: root.path).contains { $0.hasSuffix(".tmp") })
+        var opens = 0
+        let startup = NoteStartupController(markerStore: LocalRestoreMarkerStore(fileSystem: LocalNoteFileSystem(rootURL: root))) {
+            opens += 1
+            return try NotePersistenceController.makeContainer(fileSystem: LocalNoteFileSystem(rootURL: root), inMemory: true)
+        }
+        startup.recheck()
+        if case .ready = startup.state {} else { XCTFail("A resolved marker should allow normal startup") }
+        XCTAssertEqual(opens, 1)
+    }
+
     func testStartupFallbackRecoveryOverridesMissingOrResolvedRoot() throws {
         for hasRootMarker in [false, true] {
             let root = try makeTemporaryDirectory()
@@ -1801,8 +1867,70 @@ private final class StartupFaultFileSystem: LocalNoteFileSystem {
         try super.moveItem(at: sourceURL, to: destinationURL)
     }
 
+    override func replaceItem(at destinationURL: URL, withItemAt sourceURL: URL) throws {
+        mutations.append("replace")
+        try super.replaceItem(at: destinationURL, withItemAt: sourceURL)
+    }
+
     override func removeItem(at url: URL) throws {
         mutations.append("remove")
+        try super.removeItem(at: url)
+    }
+}
+
+private enum MarkerCrashPoint: CaseIterable {
+    case temporaryWrite
+    case readBack
+    case beforeReplace
+    case afterReplace
+}
+
+/// Simulates a process kill: the crash point throws, and every later mutation fails,
+/// so no recovery or fallback code can run after the interruption.
+private final class MarkerCrashFileSystem: LocalNoteFileSystem {
+    let crashPoint: MarkerCrashPoint
+    private(set) var crashed = false
+    private(set) var removedURLs: [URL] = []
+
+    init(rootURL: URL, crashPoint: MarkerCrashPoint) {
+        self.crashPoint = crashPoint
+        super.init(rootURL: rootURL)
+    }
+
+    private func crash() -> Error {
+        crashed = true
+        return POSIXError(.EINTR)
+    }
+
+    override func createDirectory(at url: URL) throws {
+        if crashed { throw crash() }
+        try super.createDirectory(at: url)
+    }
+
+    override func writeAndFlush(_ data: Data, to url: URL) throws {
+        if crashed || crashPoint == .temporaryWrite { throw crash() }
+        try super.writeAndFlush(data, to: url)
+    }
+
+    override func readData(at url: URL) throws -> Data {
+        if !crashed, crashPoint == .readBack, url.pathExtension == "tmp" { throw crash() }
+        return try super.readData(at: url)
+    }
+
+    override func moveItem(at sourceURL: URL, to destinationURL: URL) throws {
+        if crashed { throw crash() }
+        try super.moveItem(at: sourceURL, to: destinationURL)
+    }
+
+    override func replaceItem(at destinationURL: URL, withItemAt sourceURL: URL) throws {
+        if crashed || crashPoint == .beforeReplace { throw crash() }
+        try super.replaceItem(at: destinationURL, withItemAt: sourceURL)
+        if crashPoint == .afterReplace { throw crash() }
+    }
+
+    override func removeItem(at url: URL) throws {
+        if crashed { throw crash() }
+        removedURLs.append(url)
         try super.removeItem(at: url)
     }
 }

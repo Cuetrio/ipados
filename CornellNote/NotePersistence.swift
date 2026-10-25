@@ -37,6 +37,8 @@ protocol NoteFileSystem: AnyObject {
     func writeAndFlush(_ data: Data, to url: URL) throws
     func readData(at url: URL) throws -> Data
     func moveItem(at sourceURL: URL, to destinationURL: URL) throws
+    /// Atomically replaces any existing destination; the destination is never absent.
+    func replaceItem(at destinationURL: URL, withItemAt sourceURL: URL) throws
     func removeItem(at url: URL) throws
     func contentsOfDirectory(at url: URL) throws -> [URL]
     func fileExists(at url: URL) -> Bool
@@ -86,6 +88,13 @@ class LocalNoteFileSystem: NoteFileSystem {
 
     func moveItem(at sourceURL: URL, to destinationURL: URL) throws {
         try fileManager.moveItem(at: sourceURL, to: destinationURL)
+    }
+
+    func replaceItem(at destinationURL: URL, withItemAt sourceURL: URL) throws {
+        // rename(2) swaps the directory entry in one step on the same volume.
+        guard rename(sourceURL.path, destinationURL.path) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
     }
 
     func removeItem(at url: URL) throws {
