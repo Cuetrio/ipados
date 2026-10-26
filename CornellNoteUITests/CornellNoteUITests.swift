@@ -1,8 +1,8 @@
 import XCTest
 
 /// Exercises the Editor through the real UI on a simulator. Every position is derived from the
-/// canvas frame, so the tests do not depend on one iPad's screen size. Each test starts and ends
-/// with an empty Library, so notes from other tests never mix in.
+/// canvas frame, so the tests do not depend on one iPad's screen size. Each launch uses its own
+/// empty temporary store, so tests never touch the user's notes or each other's.
 final class CornellNoteUITests: XCTestCase {
     private var app: XCUIApplication!
 
@@ -10,9 +10,11 @@ final class CornellNoteUITests: XCTestCase {
         continueAfterFailure = false
         XCUIDevice.shared.orientation = .landscapeLeft
         app = XCUIApplication()
+        // Must match LocalNoteFileSystem.uiTestStoreEnvironmentKey in the app.
+        app.launchEnvironment["CORNELL_NOTE_UI_TEST_STORE"] = UUID().uuidString
         app.launch()
         XCTAssertTrue(app.buttons["新規ノート"].waitForExistence(timeout: 10))
-        deleteAllNotes()
+        XCTAssertEqual(notes.count, 0, "A UI test must start from its own empty store")
 
         app.buttons["新規ノート"].tap()
         XCTAssertTrue(waitUntil { self.notes.count == 1 }, "The new note must appear in the Library")
@@ -23,13 +25,6 @@ final class CornellNoteUITests: XCTestCase {
 
     override func tearDownWithError() throws {
         XCUIDevice.shared.orientation = .landscapeLeft
-        guard let app else { return }
-        if app.buttons["ライブラリ"].exists {
-            app.buttons["ライブラリ"].tap()
-        }
-        if app.buttons["新規ノート"].waitForExistence(timeout: 10) {
-            deleteAllNotes()
-        }
     }
 
     func testAppStaysInLandscapeWhenTheDeviceTurnsToPortrait() {
@@ -189,26 +184,6 @@ final class CornellNoteUITests: XCTestCase {
 
     private func pageY(_ fraction: CGFloat) -> CGFloat {
         canvas.frame.minY + canvas.frame.height * fraction
-    }
-
-    /// Every note row, whatever its title; tests that rename a note must still clean it up.
-    /// The empty-Library placeholder is also a cell, but it has no button.
-    private var libraryRows: XCUIElementQuery {
-        app.collectionViews.firstMatch.cells.containing(.button, identifier: nil)
-    }
-
-    private func deleteAllNotes(file: StaticString = #filePath, line: UInt = #line) {
-        var remaining = 50
-        while libraryRows.count > 0 && remaining > 0 {
-            remaining -= 1
-            let before = libraryRows.count
-            libraryRows.element(boundBy: 0).swipeLeft()
-            app.buttons["削除"].firstMatch.tap()
-            let confirm = app.alerts.buttons["削除"]
-            XCTAssertTrue(confirm.waitForExistence(timeout: 5), "Deleting a note asks for confirmation", file: file, line: line)
-            confirm.tap()
-            XCTAssertTrue(waitUntil { self.libraryRows.count < before }, "The note must be deleted", file: file, line: line)
-        }
     }
 
     private func point(_ x: CGFloat, _ y: CGFloat) -> XCUICoordinate {

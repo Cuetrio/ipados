@@ -28,12 +28,6 @@ final class NoteCanvasView: PKCanvasView {
         backgroundView.bounds = CGRect(origin: .zero, size: pageSize)
         backgroundView.center = CGPoint(x: pageSize.width * zoomScale / 2, y: pageSize.height * zoomScale / 2)
         backgroundView.transform = CGAffineTransform(scaleX: zoomScale, y: zoomScale)
-        // Render the lines at the zoomed resolution so they stay sharp instead of being upscaled.
-        let renderScale = (window?.screen.scale ?? traitCollection.displayScale) * zoomScale
-        if backgroundView.contentScaleFactor != renderScale {
-            backgroundView.contentScaleFactor = renderScale
-            backgroundView.setNeedsDisplay()
-        }
         sendSubviewToBack(backgroundView)
     }
 }

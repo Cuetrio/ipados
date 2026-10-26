@@ -372,6 +372,24 @@ final class CornellNoteTests: XCTestCase {
         XCTAssertThrowsError(try BackupPathValidator.validate("drawings/11111111-1111-1111-1111-111111111111/../metadata.store"))
     }
 
+    func testUITestStoreIsIsolatedFromTheUserStore() {
+        let key = LocalNoteFileSystem.uiTestStoreEnvironmentKey
+        let userStore = LocalNoteFileSystem.defaultRootURL(environment: [:])
+        XCTAssertEqual(userStore.lastPathComponent, "CornellNote")
+
+        let id = UUID()
+        let testStore = LocalNoteFileSystem.defaultRootURL(environment: [key: id.uuidString])
+        XCTAssertEqual(testStore.lastPathComponent, id.uuidString)
+        XCTAssertEqual(testStore.deletingLastPathComponent().lastPathComponent, "CornellNote-UITests")
+        XCTAssertTrue(testStore.path.hasPrefix(FileManager.default.temporaryDirectory.path))
+        XCTAssertFalse(testStore.path.hasPrefix(userStore.path))
+
+        // Anything but a UUID cannot steer the store to another path.
+        for value in ["", "../CornellNote", "/tmp/elsewhere"] {
+            XCTAssertEqual(LocalNoteFileSystem.defaultRootURL(environment: [key: value]), userStore, value)
+        }
+    }
+
     func testRestoreMarkerRoundTripAndProviderRequiresExplicitReplacement() throws {
         let root = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
