@@ -5,12 +5,7 @@ import SwiftUI
 /// and carries the fixed Cornell background so it pans and zooms with the ink.
 final class NoteCanvasView: PKCanvasView {
     private let drawingHistory = UndoManager()
-    private let backgroundView: UIView = {
-        let view = UIHostingController(rootView: CornellBackgroundView()).view!
-        view.backgroundColor = .clear
-        view.isUserInteractionEnabled = false
-        return view
-    }()
+    private let backgroundView = CornellBackgroundView()
 
     override var undoManager: UndoManager? { drawingHistory }
 
@@ -33,6 +28,12 @@ final class NoteCanvasView: PKCanvasView {
         backgroundView.bounds = CGRect(origin: .zero, size: pageSize)
         backgroundView.center = CGPoint(x: pageSize.width * zoomScale / 2, y: pageSize.height * zoomScale / 2)
         backgroundView.transform = CGAffineTransform(scaleX: zoomScale, y: zoomScale)
+        // Render the lines at the zoomed resolution so they stay sharp instead of being upscaled.
+        let renderScale = (window?.screen.scale ?? traitCollection.displayScale) * zoomScale
+        if backgroundView.contentScaleFactor != renderScale {
+            backgroundView.contentScaleFactor = renderScale
+            backgroundView.setNeedsDisplay()
+        }
         sendSubviewToBack(backgroundView)
     }
 }
@@ -42,7 +43,9 @@ struct CanvasView: UIViewRepresentable {
     var isEditable = true
     var onDrawingChanged: (PKDrawing) -> Void = { _ in }
 
-    static let initialTool = PKInkingTool(.pen, color: .label, width: 3)
+    /// PencilKit stores ink in its light-appearance color and adapts it for dark mode itself,
+    /// so the default pen is plain black (shown white in dark mode), not a dynamic color.
+    static let initialTool = PKInkingTool(.pen, color: .black, width: 3)
 
     func makeCoordinator() -> Coordinator {
         Coordinator(onDrawingChanged: onDrawingChanged)
