@@ -48,12 +48,10 @@ struct EditorView: View {
                 }
 
                 GeometryReader { proxy in
-                    ZStack {
-                        CornellBackgroundView()
-                        CanvasView(canvasView: canvasView, isEditable: session.canEdit) { drawing in
-                            session.updateDrawing(drawing)
-                            refreshHistoryState()
-                        }
+                    // The canvas draws the Cornell background itself so it zooms with the ink.
+                    CanvasView(canvasView: canvasView, isEditable: session.canEdit) { drawing in
+                        session.updateDrawing(drawing)
+                        refreshHistoryState()
                     }
                     .padding()
                     .frame(width: proxy.size.width, height: proxy.size.height)
@@ -116,6 +114,7 @@ struct EditorView: View {
     /// Shows the persisted drawing; loading is not an edit, so the drawing history starts empty.
     private func showLoadedDrawing() {
         canvasView.drawing = session.drawingDraft
+        CanvasView.Coordinator.describeStrokes(of: canvasView)
         canvasView.undoManager?.removeAllActions()
         refreshHistoryState()
     }

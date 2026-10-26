@@ -1,11 +1,40 @@
 import PencilKit
 import SwiftUI
 
-/// Keeps drawing undo/redo separate from the title field and other window-level edits.
+/// Keeps drawing undo/redo separate from the title field and other window-level edits,
+/// and carries the fixed Cornell background so it pans and zooms with the ink.
 final class NoteCanvasView: PKCanvasView {
     private let drawingHistory = UndoManager()
+    private let backgroundView: UIView = {
+        let view = UIHostingController(rootView: CornellBackgroundView()).view!
+        view.backgroundColor = .clear
+        view.isUserInteractionEnabled = false
+        return view
+    }()
 
     override var undoManager: UndoManager? { drawingHistory }
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        insertSubview(backgroundView, at: 0)
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        insertSubview(backgroundView, at: 0)
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        // Lay out the page at the unzoomed canvas size, then scale it like the ink. Scroll view
+        // subviews already follow the content offset, so only the zoom scale needs applying.
+        let pageSize = bounds.size
+        backgroundView.transform = .identity
+        backgroundView.bounds = CGRect(origin: .zero, size: pageSize)
+        backgroundView.center = CGPoint(x: pageSize.width * zoomScale / 2, y: pageSize.height * zoomScale / 2)
+        backgroundView.transform = CGAffineTransform(scaleX: zoomScale, y: zoomScale)
+        sendSubviewToBack(backgroundView)
+    }
 }
 
 struct CanvasView: UIViewRepresentable {
@@ -29,6 +58,9 @@ struct CanvasView: UIViewRepresentable {
         canvasView.minimumZoomScale = 1
         canvasView.maximumZoomScale = 4
         canvasView.delegate = context.coordinator
+        canvasView.accessibilityIdentifier = "note-canvas"
+        canvasView.accessibilityLabel = "手書き"
+        Coordinator.describeStrokes(of: canvasView)
 
         // The standard picker supplies tools, colors, and widths; the canvas follows its selection.
         let toolPicker = context.coordinator.toolPicker
@@ -70,7 +102,13 @@ struct CanvasView: UIViewRepresentable {
         }
 
         func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
+            Self.describeStrokes(of: canvasView)
             onDrawingChanged(canvasView.drawing)
+        }
+
+        /// Tells VoiceOver (and UI tests) how many strokes the note currently holds.
+        static func describeStrokes(of canvasView: PKCanvasView) {
+            canvasView.accessibilityValue = "線 \(canvasView.drawing.strokes.count) 本"
         }
     }
 }
