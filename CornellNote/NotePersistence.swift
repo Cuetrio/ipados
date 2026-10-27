@@ -48,14 +48,26 @@ class LocalNoteFileSystem: NoteFileSystem {
     let rootURL: URL
     private let fileManager: FileManager
 
+    /// UI tests launch the app with this environment value set to a UUID. All notes then live in
+    /// a fresh temporary directory, so tests never read, change, or delete the user's notes.
+    static let uiTestStoreEnvironmentKey = "CORNELL_NOTE_UI_TEST_STORE"
+
     init(rootURL: URL? = nil, fileManager: FileManager = .default) {
         self.fileManager = fileManager
-        if let rootURL {
-            self.rootURL = rootURL
-        } else {
-            let applicationSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            self.rootURL = applicationSupport.appendingPathComponent("CornellNote", isDirectory: true)
+        self.rootURL = rootURL ?? Self.defaultRootURL(fileManager: fileManager)
+    }
+
+    static func defaultRootURL(
+        fileManager: FileManager = .default,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> URL {
+        if let value = environment[uiTestStoreEnvironmentKey], let id = UUID(uuidString: value) {
+            return fileManager.temporaryDirectory
+                .appendingPathComponent("CornellNote-UITests", isDirectory: true)
+                .appendingPathComponent(id.uuidString, isDirectory: true)
         }
+        let applicationSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        return applicationSupport.appendingPathComponent("CornellNote", isDirectory: true)
     }
 
     func createDirectory(at url: URL) throws {
