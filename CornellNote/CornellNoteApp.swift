@@ -3,16 +3,19 @@ import SwiftUI
 
 @main
 struct CornellNoteApp: App {
+    @State private var startup = NoteStartupController(fileSystem: LocalNoteFileSystem())
+
     var body: some Scene {
         WindowGroup {
-            CornellNoteRootView()
+            CornellNoteRootView(startup: startup)
         }
     }
 }
 
 @MainActor
 private struct CornellNoteRootView: View {
-    @State private var startup = NoteStartupController(fileSystem: LocalNoteFileSystem())
+    let startup: NoteStartupController
+    @State private var restoreState: RestoreState?
 
     var body: some View {
         Group {
@@ -20,7 +23,7 @@ private struct CornellNoteRootView: View {
             case .checking:
                 ProgressView("保存領域を確認中")
             case .ready(let generation):
-                LibraryView(writeAdmission: generation.writeAdmission)
+                LibraryView(restoreState: $restoreState, fileSystem: generation.fileSystem, writeAdmission: generation.writeAdmission, startup: startup)
                     .modelContainer(generation.container)
                     .id(ObjectIdentifier(generation.container))
             case .blocked(let failure):
@@ -35,9 +38,6 @@ private struct CornellNoteRootView: View {
         }
         .task {
             if case .checking = startup.state { startup.recheck() }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .cornellNoteStoreDidSwitch)) { _ in
-            startup.recheck()
         }
     }
 }

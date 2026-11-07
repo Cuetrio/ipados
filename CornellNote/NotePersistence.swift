@@ -131,16 +131,24 @@ final class NotePersistenceController {
     let fileSystem: NoteFileSystem
     var clock: () -> Date
     private let commitMetadata: () throws -> Void
+    private let canWrite: () -> Bool
+    private let renderThumbnail: (PKDrawing) -> UIImage
 
     init(
         modelContext: ModelContext,
         fileSystem: NoteFileSystem = LocalNoteFileSystem(),
         clock: @escaping () -> Date = { .now },
-        commitMetadata: (() throws -> Void)? = nil
+        commitMetadata: (() throws -> Void)? = nil,
+        canWrite: @escaping () -> Bool = { true },
+        renderThumbnail: @escaping (PKDrawing) -> UIImage = {
+            $0.image(from: CGRect(x: 0, y: 0, width: 1200, height: 900), scale: 1)
+        }
     ) {
         self.modelContext = modelContext
         self.fileSystem = fileSystem
         self.clock = clock
+        self.canWrite = canWrite
+        self.renderThumbnail = renderThumbnail
         self.commitMetadata = commitMetadata ?? { try modelContext.save() }
     }
 
@@ -160,6 +168,7 @@ final class NotePersistenceController {
     }
 
     func save(note: NoteRecord, drawing: PKDrawing, title: String? = nil) throws {
+        guard canWrite() else { throw BackupRestoreError.restoreUnavailable }
         let data = drawing.dataRepresentation()
         let drawingDirectory = drawingsDirectory(for: note)
         try fileSystem.createDirectory(at: drawingDirectory)
@@ -215,6 +224,7 @@ final class NotePersistenceController {
     /// Commits a title change while keeping the verified active drawing generation.
     /// No drawing bytes are serialized, written, or copied, so no capacity is required.
     func saveTitle(note: NoteRecord, title: String) throws {
+        guard canWrite() else { throw BackupRestoreError.restoreUnavailable }
         guard note.drawingSchemaVersion == Self.drawingSchemaVersion else {
             throw NotePersistenceError.unsupportedDrawingSchema
         }
@@ -252,26 +262,77 @@ final class NotePersistenceController {
         return drawing
     }
 
+    // The cache key follows committed metadata, never the editor's in-memory draft.
+    static func thumbnailKey(for note: NoteRecord) -> String {
+        thumbnailKey(schemaVersion: note.drawingSchemaVersion, fileName: note.drawingFileName, checksum: note.drawingChecksum)
+    }
+
+    static func thumbnailKey(schemaVersion: Int, fileName: String?, checksum: String?) -> String {
+        let identity = "\(schemaVersion):\(fileName ?? ""):\(checksum ?? "")"
+        return Data(identity.utf8).sha256Hex
+    }
+
+    static func thumbnailURL(root: URL, id: UUID, schemaVersion: Int, fileName: String?, checksum: String?) -> URL {
+        root.appendingPathComponent("thumbnails", isDirectory: true)
+            .appendingPathComponent(id.uuidString, isDirectory: true)
+            .appendingPathComponent("\(thumbnailKey(schemaVersion: schemaVersion, fileName: fileName, checksum: checksum)).png")
+    }
+
+    private func thumbnailDirectory(for note: NoteRecord) -> URL {
+        fileSystem.rootURL.appendingPathComponent("thumbnails", isDirectory: true)
+            .appendingPathComponent(note.id.uuidString, isDirectory: true)
+    }
+
+    private func thumbnailURL(for note: NoteRecord) -> URL {
+        Self.thumbnailURL(root: fileSystem.rootURL, id: note.id, schemaVersion: note.drawingSchemaVersion, fileName: note.drawingFileName, checksum: note.drawingChecksum)
+    }
+
     @discardableResult
     func regenerateThumbnail(for note: NoteRecord, drawing: PKDrawing) throws -> URL {
-        let directory = fileSystem.rootURL.appendingPathComponent("thumbnails", isDirectory: true)
+        let image = renderThumbnail(drawing)
+        return try storeThumbnail(image, for: note)
+    }
+
+    private func storeThumbnail(_ image: UIImage, for note: NoteRecord) throws -> URL {
+        guard canWrite() else { throw BackupRestoreError.restoreUnavailable }
+        let directory = thumbnailDirectory(for: note)
         try fileSystem.createDirectory(at: directory)
-        let url = directory.appendingPathComponent("\(note.id.uuidString).png")
-        let image = drawing.image(from: CGRect(x: 0, y: 0, width: 1200, height: 900), scale: 1)
+        let url = thumbnailURL(for: note)
         guard let data = image.pngData() else { throw NotePersistenceError.invalidDrawingData }
-        try fileSystem.writeAndFlush(data, to: url)
+        let temporaryURL = directory.appendingPathComponent(".\(UUID().uuidString).tmp")
+        do {
+            try fileSystem.writeAndFlush(data, to: temporaryURL)
+            try fileSystem.replaceItem(at: url, withItemAt: temporaryURL)
+        } catch {
+            try? fileSystem.removeItem(at: temporaryURL)
+            throw error
+        }
+        if let entries = try? fileSystem.contentsOfDirectory(at: directory) {
+            for entry in entries where entry != url && entry.pathExtension == "png" {
+                try? fileSystem.removeItem(at: entry)
+            }
+        }
         return url
     }
 
     func thumbnailData(for note: NoteRecord) throws -> Data? {
-        let url = fileSystem.rootURL
-            .appendingPathComponent("thumbnails", isDirectory: true)
-            .appendingPathComponent("\(note.id.uuidString).png")
+        let url = thumbnailURL(for: note)
         guard fileSystem.fileExists(at: url) else { return nil }
         return try fileSystem.readData(at: url)
     }
 
+    func thumbnailImage(for note: NoteRecord) -> UIImage? {
+        if let data = try? thumbnailData(for: note), let image = UIImage(data: data) {
+            return image
+        }
+        guard let drawing = try? loadDrawing(for: note) else { return nil }
+        let image = renderThumbnail(drawing)
+        _ = try? storeThumbnail(image, for: note)
+        return image
+    }
+
     func delete(note: NoteRecord) throws {
+        guard canWrite() else { throw BackupRestoreError.restoreUnavailable }
         modelContext.delete(note)
         do {
             try commitMetadata()
@@ -280,10 +341,12 @@ final class NotePersistenceController {
             throw NotePersistenceError.metadataCommitFailed
         }
         try fileSystem.removeItem(at: drawingsDirectory(for: note))
+        try fileSystem.removeItem(at: thumbnailDirectory(for: note))
         try fileSystem.removeItem(at: fileSystem.rootURL.appendingPathComponent("thumbnails", isDirectory: true).appendingPathComponent("\(note.id.uuidString).png"))
     }
 
     func cleanupOrphans(for note: NoteRecord) {
+        guard canWrite() else { return }
         // Invalid metadata must not turn the last good generation into a deletable orphan.
         guard (try? loadDrawing(for: note)) != nil else { return }
         let directory = drawingsDirectory(for: note)
