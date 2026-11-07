@@ -204,6 +204,8 @@ final class BackupRestoreCoordinator {
         try? markerStore.read()
     }
 
+    static let capacityReserve: UInt64 = 4_096
+
     private func preflight(data: Data, current: CurrentSnapshot) throws {
         if faultPlan.failCapacityPreflight { throw BackupRestoreError.capacityInsufficient }
         func saturatingAdd(_ lhs: UInt64, _ rhs: UInt64) -> UInt64 {
@@ -216,7 +218,7 @@ final class BackupRestoreCoordinator {
         }
         let requiredWithReserve = saturatingAdd(
             saturatingAdd(importedBytes, importedBytes),
-            saturatingAdd(currentPayloadBytes, 4_096)
+            saturatingAdd(currentPayloadBytes, Self.capacityReserve)
         )
         let available = try fileSystem.availableCapacity(for: fileSystem.rootURL)
         guard available >= 0, UInt64(available) >= requiredWithReserve else {

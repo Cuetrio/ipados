@@ -13,6 +13,7 @@ final class NoteEditingSession {
     /// Only drawing edits need a new drawing generation; title-only saves keep the active one.
     private var hasUnsavedDrawing = false
     private(set) var saveState: NoteSaveState = .saved
+    private(set) var lastSavedAt: Date?
     var loadFailureMessage: String? {
         guard case .failed(let message) = loadState else { return nil }
         return message
@@ -100,6 +101,7 @@ final class NoteEditingSession {
             } else {
                 try persistence.saveTitle(note: note, title: titleDraft)
             }
+            lastSavedAt = note.updatedAt
             hasUnsavedChanges = false
             hasUnsavedDrawing = false
             saveFailureMessage = nil

@@ -252,23 +252,58 @@ final class NotePersistenceController {
         return drawing
     }
 
+    // The cache key follows committed metadata, never the editor's in-memory draft.
+    static func thumbnailKey(for note: NoteRecord) -> String {
+        let identity = "\(note.drawingSchemaVersion):\(note.drawingFileName ?? ""):\(note.drawingChecksum ?? "")"
+        return Data(identity.utf8).sha256Hex
+    }
+
+    private func thumbnailDirectory(for note: NoteRecord) -> URL {
+        fileSystem.rootURL.appendingPathComponent("thumbnails", isDirectory: true)
+            .appendingPathComponent(note.id.uuidString, isDirectory: true)
+    }
+
+    private func thumbnailURL(for note: NoteRecord) -> URL {
+        thumbnailDirectory(for: note).appendingPathComponent("\(Self.thumbnailKey(for: note)).png")
+    }
+
     @discardableResult
     func regenerateThumbnail(for note: NoteRecord, drawing: PKDrawing) throws -> URL {
-        let directory = fileSystem.rootURL.appendingPathComponent("thumbnails", isDirectory: true)
+        let directory = thumbnailDirectory(for: note)
         try fileSystem.createDirectory(at: directory)
-        let url = directory.appendingPathComponent("\(note.id.uuidString).png")
+        let url = thumbnailURL(for: note)
         let image = drawing.image(from: CGRect(x: 0, y: 0, width: 1200, height: 900), scale: 1)
         guard let data = image.pngData() else { throw NotePersistenceError.invalidDrawingData }
-        try fileSystem.writeAndFlush(data, to: url)
+        let temporaryURL = directory.appendingPathComponent(".\(UUID().uuidString).tmp")
+        do {
+            try fileSystem.writeAndFlush(data, to: temporaryURL)
+            try fileSystem.replaceItem(at: url, withItemAt: temporaryURL)
+        } catch {
+            try? fileSystem.removeItem(at: temporaryURL)
+            throw error
+        }
+        if let entries = try? fileSystem.contentsOfDirectory(at: directory) {
+            for entry in entries where entry != url && entry.pathExtension == "png" {
+                try? fileSystem.removeItem(at: entry)
+            }
+        }
         return url
     }
 
     func thumbnailData(for note: NoteRecord) throws -> Data? {
-        let url = fileSystem.rootURL
-            .appendingPathComponent("thumbnails", isDirectory: true)
-            .appendingPathComponent("\(note.id.uuidString).png")
+        let url = thumbnailURL(for: note)
         guard fileSystem.fileExists(at: url) else { return nil }
         return try fileSystem.readData(at: url)
+    }
+
+    func thumbnailImage(for note: NoteRecord) -> UIImage? {
+        if let data = try? thumbnailData(for: note), let image = UIImage(data: data) {
+            return image
+        }
+        guard let drawing = try? loadDrawing(for: note) else { return nil }
+        let image = drawing.image(from: CGRect(x: 0, y: 0, width: 1200, height: 900), scale: 1)
+        _ = try? regenerateThumbnail(for: note, drawing: drawing)
+        return image
     }
 
     func delete(note: NoteRecord) throws {
@@ -280,6 +315,7 @@ final class NotePersistenceController {
             throw NotePersistenceError.metadataCommitFailed
         }
         try fileSystem.removeItem(at: drawingsDirectory(for: note))
+        try fileSystem.removeItem(at: thumbnailDirectory(for: note))
         try fileSystem.removeItem(at: fileSystem.rootURL.appendingPathComponent("thumbnails", isDirectory: true).appendingPathComponent("\(note.id.uuidString).png"))
     }
 

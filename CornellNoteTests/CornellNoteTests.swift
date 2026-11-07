@@ -7,6 +7,20 @@ import XCTest
 
 @MainActor
 final class CornellNoteTests: XCTestCase {
+    func testCapacityDisplayDoesNotReportUnknownAsAvailable() {
+        XCTAssertEqual(LibraryBackupActions.capacityLabel(nil), "取得できません")
+        XCTAssertEqual(LibraryBackupActions.capacityLabel(-1), "取得できません")
+        XCTAssertEqual(LibraryBackupActions.capacityLabel(0), "空き容量なし")
+        XCTAssertNotEqual(LibraryBackupActions.capacityLabel(1024), "取得できません")
+        XCTAssertFalse(LibraryBackupActions.isLowCapacity(nil))
+        XCTAssertFalse(LibraryBackupActions.isLowCapacity(-1))
+        XCTAssertTrue(LibraryBackupActions.isLowCapacity(0))
+        XCTAssertTrue(LibraryBackupActions.isLowCapacity(1))
+        XCTAssertTrue(LibraryBackupActions.isLowCapacity(50_000))
+        XCTAssertTrue(LibraryBackupActions.isLowCapacity(LibraryBackupActions.lowCapacityWarningBytes - 1))
+        XCTAssertFalse(LibraryBackupActions.isLowCapacity(LibraryBackupActions.lowCapacityWarningBytes))
+    }
+
     func testNewNoteUsesUntitledDisplayTitle() {
         let note = NoteRecord()
 
@@ -207,6 +221,7 @@ final class CornellNoteTests: XCTestCase {
 
         XCTAssertTrue(try context.fetch(FetchDescriptor<NoteRecord>()).isEmpty)
         XCTAssertFalse(fileSystem.fileExists(at: root.appendingPathComponent("drawings/\(id.uuidString)")))
+        XCTAssertFalse(fileSystem.fileExists(at: root.appendingPathComponent("thumbnails/\(id.uuidString)")))
         XCTAssertFalse(fileSystem.fileExists(at: root.appendingPathComponent("thumbnails/\(id.uuidString).png")))
         XCTAssertEqual(note.displayTitle, "無題のノート")
     }
@@ -229,6 +244,73 @@ final class CornellNoteTests: XCTestCase {
 
         XCTAssertTrue(FileManager.default.fileExists(atPath: regenerated.path))
         XCTAssertFalse(try XCTUnwrap(try Data(contentsOf: regenerated)).isEmpty)
+    }
+
+    func testThumbnailTracksCommittedDrawingAcrossReopenAndRegeneratesCorruptCache() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileSystem = LocalNoteFileSystem(rootURL: root)
+        let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
+        let context = ModelContext(container)
+        let controller = NotePersistenceController(modelContext: context, fileSystem: fileSystem)
+        let note = NoteRecord()
+        context.insert(note)
+        try context.save()
+        try controller.save(note: note, drawing: nonemptyDrawing(offset: 0))
+        let oldURL = try controller.regenerateThumbnail(for: note, drawing: controller.loadDrawing(for: note))
+        let oldKey = NotePersistenceController.thumbnailKey(for: note)
+        let oldData = try Data(contentsOf: oldURL)
+
+        try controller.save(note: note, drawing: nonemptyDrawing(offset: 200))
+        XCTAssertNotEqual(NotePersistenceController.thumbnailKey(for: note), oldKey)
+        XCTAssertNil(try controller.thumbnailData(for: note))
+        XCTAssertNotNil(controller.thumbnailImage(for: note))
+        let newData = try XCTUnwrap(controller.thumbnailData(for: note))
+        XCTAssertNotEqual(newData, oldData)
+
+        let reopenedContainer = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
+        let reopenedContext = ModelContext(reopenedContainer)
+        let reopened = try XCTUnwrap(try reopenedContext.fetch(FetchDescriptor<NoteRecord>()).first)
+        let reopenedController = NotePersistenceController(modelContext: reopenedContext, fileSystem: fileSystem)
+        XCTAssertEqual(try reopenedController.thumbnailData(for: reopened), newData)
+        let newURL = try reopenedController.regenerateThumbnail(for: reopened, drawing: reopenedController.loadDrawing(for: reopened))
+        try Data("corrupt".utf8).write(to: newURL)
+        XCTAssertNotNil(reopenedController.thumbnailImage(for: reopened))
+        XCTAssertNotNil(UIImage(data: try XCTUnwrap(reopenedController.thumbnailData(for: reopened))))
+    }
+
+    func testThumbnailFailureDoesNotChangeSavedDrawingOrFailedDraft() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileSystem = FaultInjectingFileSystem(rootURL: root)
+        let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
+        let context = ModelContext(container)
+        let controller = NotePersistenceController(modelContext: context, fileSystem: fileSystem)
+        let note = NoteRecord()
+        context.insert(note)
+        try context.save()
+        let session = NoteEditingSession(note: note, persistence: controller)
+        session.updateDrawing(nonemptyDrawing(offset: 0))
+        session.flushSave()
+        XCTAssertEqual(session.saveState, .saved)
+        let savedPointer = note.drawingFileName
+        fileSystem.failNextWrite = true
+        XCTAssertNotNil(controller.thumbnailImage(for: note))
+        XCTAssertNil(try controller.thumbnailData(for: note))
+        XCTAssertEqual(note.drawingFileName, savedPointer)
+        XCTAssertEqual(session.saveState, .saved)
+        XCTAssertNotNil(controller.thumbnailImage(for: note))
+        XCTAssertNotNil(try controller.thumbnailData(for: note))
+
+        session.updateDrawing(nonemptyDrawing(offset: 200))
+        fileSystem.failNextWrite = true
+        session.flushSave()
+        XCTAssertEqual(session.saveState, .saveFailed)
+        XCTAssertTrue(session.hasUnsavedChanges)
+        XCTAssertEqual(note.drawingFileName, savedPointer)
+        XCTAssertNotNil(try controller.thumbnailData(for: note))
+        XCTAssertEqual(try controller.loadDrawing(for: note).bounds, nonemptyDrawing(offset: 0).bounds)
+        XCTAssertEqual(session.drawingDraft.bounds, nonemptyDrawing(offset: 200).bounds)
     }
 
     func testBackupEnvelopeHasDeterministicCanonicalGoldenBytes() throws {
@@ -932,12 +1014,14 @@ final class CornellNoteTests: XCTestCase {
             let drawingDirectory = root.appendingPathComponent("drawings/\(note.id.uuidString)")
             let originalFiles = try FileManager.default.contentsOfDirectory(atPath: drawingDirectory.path).sorted()
             let session = NoteEditingSession(note: note, persistence: controller)
+            XCTAssertNil(session.lastSavedAt, "Existing note timestamps are not session save timestamps")
 
             // A failed metadata commit restores the committed title and keeps the pointer.
             session.updateTitle("Failed title")
             fileSystem.failMetadataCommit = true
             session.flushSave()
             XCTAssertEqual(session.saveState, .saveFailed)
+            XCTAssertNil(session.lastSavedAt)
             XCTAssertTrue(session.hasUnsavedChanges)
             XCTAssertEqual(session.titleDraft, "Failed title")
             XCTAssertEqual(try SavedNoteSnapshot(note: note, root: root), original)
@@ -954,6 +1038,7 @@ final class CornellNoteTests: XCTestCase {
             committed = try SavedNoteSnapshot(note: note, root: root)
             XCTAssertEqual(committed.title, "After")
             XCTAssertEqual(committed.updatedAt, Date(timeIntervalSince1970: 300))
+            XCTAssertEqual(session.lastSavedAt, committed.updatedAt)
             XCTAssertEqual(committed.pointer, original.pointer)
             XCTAssertEqual(committed.checksum, original.checksum)
             XCTAssertEqual(committed.bytes, original.bytes)

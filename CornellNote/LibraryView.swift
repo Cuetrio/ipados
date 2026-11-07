@@ -7,7 +7,7 @@ struct LibraryView: View {
     @Environment(\.scenePhase) private var scenePhase
     @Query(sort: \NoteRecord.updatedAt, order: .reverse) private var notes: [NoteRecord]
     @State private var noteToDelete: NoteRecord?
-    @State private var restoreState: RestoreState?
+    @Binding var restoreState: RestoreState?
     @State private var editingSession: NoteEditingSession?
     @State private var isEditorPresented = false
 
@@ -65,7 +65,9 @@ struct LibraryView: View {
                 }
             }
             .onChange(of: isEditorPresented) { _, isPresented in
-                if !isPresented { editingSession?.flushSave() }
+                if !isPresented {
+                    editingSession?.flushSave()
+                }
             }
             .onChange(of: scenePhase) { _, phase in
                 if phase == .background && !isEditorPresented { editingSession?.flushSave() }
@@ -91,6 +93,8 @@ struct LibraryView: View {
             .modifier(LibraryBackupActions(
                 writeAdmission: writeAdmission,
                 hasRetainedDraft: hasRetainedDraft,
+                saveState: editingSession?.saveState ?? .saved,
+                lastSaved: notes.first?.updatedAt,
                 restoreState: $restoreState
             ))
             .task {
@@ -158,19 +162,13 @@ private struct NoteThumbnailView: View {
         }
         .frame(width: 72, height: 54)
         .clipShape(RoundedRectangle(cornerRadius: 6))
-        .task { loadThumbnail() }
+        .task(id: NotePersistenceController.thumbnailKey(for: note)) { loadThumbnail() }
     }
 
     private func loadThumbnail() {
+        image = nil
         guard writeAdmission.isAllowed else { return }
         let persistence = NotePersistenceController(modelContext: modelContext)
-        if let data = try? persistence.thumbnailData(for: note), let cached = UIImage(data: data) {
-            image = cached
-            return
-        }
-        guard let drawing = try? persistence.loadDrawing(for: note),
-              let url = try? persistence.regenerateThumbnail(for: note, drawing: drawing),
-              let data = try? Data(contentsOf: url) else { return }
-        image = UIImage(data: data)
+        image = persistence.thumbnailImage(for: note)
     }
 }

@@ -13,6 +13,7 @@ struct CornellNoteApp: App {
 @MainActor
 private struct CornellNoteRootView: View {
     @State private var startup = NoteStartupController(fileSystem: LocalNoteFileSystem())
+    @State private var restoreState: RestoreState?
 
     var body: some View {
         Group {
@@ -20,7 +21,7 @@ private struct CornellNoteRootView: View {
             case .checking:
                 ProgressView("保存領域を確認中")
             case .ready(let generation):
-                LibraryView(writeAdmission: generation.writeAdmission)
+                LibraryView(restoreState: $restoreState, writeAdmission: generation.writeAdmission)
                     .modelContainer(generation.container)
                     .id(ObjectIdentifier(generation.container))
             case .blocked(let failure):
