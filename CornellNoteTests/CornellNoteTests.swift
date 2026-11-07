@@ -12,7 +12,7 @@ final class CornellNoteTests: XCTestCase {
 
         for shouldFail in [false, true] {
             let root = try makeTemporaryDirectory()
-            defer { try? FileManager.default.removeItem(at: root) }
+            defer { try? removeTemporaryDirectory(at: root) }
             let fileSystem = LocalNoteFileSystem(rootURL: root)
             let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
             let oldContext = ModelContext(container)
@@ -99,7 +99,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testManagedFileWriteTruncatesExistingStagingFile() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let fileSystem = LocalNoteFileSystem(rootURL: root)
         let url = root.appendingPathComponent("staging.bin")
 
@@ -111,7 +111,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testSaveReopenAndReadBackKeepsMetadataAndDrawing() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let fileSystem = LocalNoteFileSystem(rootURL: root)
         let firstContainer = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
         let firstContext = ModelContext(firstContainer)
@@ -144,7 +144,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testCorruptReadBackPreservesOldActiveGenerationAndMetadata() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let fileSystem = FaultInjectingFileSystem(rootURL: root)
         let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
         let context = ModelContext(container)
@@ -175,7 +175,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testCapacityFailureDoesNotDeleteActiveGeneration() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let fileSystem = FaultInjectingFileSystem(rootURL: root)
         let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
         let context = ModelContext(container)
@@ -195,7 +195,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testRenameFailurePreservesOldActiveGenerationAndMetadata() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let fileSystem = FaultInjectingFileSystem(rootURL: root)
         let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
         let context = ModelContext(container)
@@ -214,7 +214,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testTemporaryWriteFailurePreservesOldActiveGenerationAndMetadata() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let fileSystem = FaultInjectingFileSystem(rootURL: root)
         let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
         let context = ModelContext(container)
@@ -233,7 +233,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testCommitFailureLeavesOrphanForSafeCleanupWithoutDeletingActiveFile() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let fileSystem = FaultInjectingFileSystem(rootURL: root)
         let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
         let context = ModelContext(container)
@@ -264,7 +264,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testLibraryDeleteRemovesMetadataGenerationsAndThumbnail() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let fileSystem = LocalNoteFileSystem(rootURL: root)
         let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
         let context = ModelContext(container)
@@ -287,7 +287,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testThumbnailCanBeRegeneratedAfterCacheIsMissing() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let fileSystem = LocalNoteFileSystem(rootURL: root)
         let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
         let context = ModelContext(container)
@@ -307,7 +307,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testThumbnailTracksCommittedDrawingAcrossReopenAndRegeneratesCorruptCache() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let fileSystem = LocalNoteFileSystem(rootURL: root)
         let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
         let context = ModelContext(container)
@@ -340,7 +340,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testThumbnailRendersOnceOnMissOrCorruptionAndNeverOnHit() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let fileSystem = FaultInjectingFileSystem(rootURL: root)
         let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
         let context = container.mainContext
@@ -376,7 +376,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testThumbnailFailureDoesNotChangeSavedDrawingOrFailedDraft() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let fileSystem = FaultInjectingFileSystem(rootURL: root)
         let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
         let context = ModelContext(container)
@@ -469,7 +469,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testPersistenceReadsCanonicalLowercaseDrawingPointer() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let fileSystem = LocalNoteFileSystem(rootURL: root)
         let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem, inMemory: true)
         let context = ModelContext(container)
@@ -569,7 +569,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testRestoreMarkerRoundTripAndProviderRequiresExplicitReplacement() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let fileSystem = LocalNoteFileSystem(rootURL: root)
         let markerStore = LocalRestoreMarkerStore(fileSystem: fileSystem)
         let marker = RestoreMarker(
@@ -606,7 +606,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testMarkerWriteFailureLeavesRecoveryMarkerInSafetyBackup() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let fileSystem = FaultInjectingFileSystem(rootURL: root)
         let safetyURL = root.appendingPathComponent("Backups/safety/safety-test", isDirectory: true)
         try fileSystem.createDirectory(at: safetyURL)
@@ -697,7 +697,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testLocalSwitcherRefusesDirectSwitchAndRollbackAndPreservesRecoveryFiles() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let fileSystem = StartupFaultFileSystem(rootURL: root)
         let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem, inMemory: true)
         let context = ModelContext(container)
@@ -735,7 +735,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testRestoreCapacityFailureLeavesCurrentDataAndDoesNotSwitch() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let fileSystem = FaultInjectingFileSystem(rootURL: root)
         fileSystem.availableCapacity = 0
         let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem, inMemory: true)
@@ -761,7 +761,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testPostSwitchReopenFailureRollsBackAndRollbackFailureRequiresRecovery() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let fileSystem = FaultInjectingFileSystem(rootURL: root)
         let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem, inMemory: true)
         let context = ModelContext(container)
@@ -792,7 +792,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testPostSwitchReopenFailureCanRollbackAndKeepRestoreFailedState() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let fileSystem = FaultInjectingFileSystem(rootURL: root)
         let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem, inMemory: true)
         let context = ModelContext(container)
@@ -820,7 +820,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testRollbackRetainedOldContextAndReopenedStore() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let fileSystem = LocalNoteFileSystem(rootURL: root)
         let startup = NoteStartupController(fileSystem: fileSystem)
         startup.recheck()
@@ -863,7 +863,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testRollbackFailureWithMarkerWriteFailureRetainsSafetyBackup() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let fileSystem = FaultInjectingFileSystem(rootURL: root)
         let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem, inMemory: true)
         let context = ModelContext(container)
@@ -892,7 +892,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testValidRestoreCompletesAndRegeneratesThumbnailWithoutRestoringCache() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let fileSystem = FaultInjectingFileSystem(rootURL: root)
         let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem, inMemory: true)
         let context = ModelContext(container)
@@ -935,7 +935,7 @@ final class CornellNoteTests: XCTestCase {
 
         for faultPlan in faultPlans {
             let root = try makeTemporaryDirectory()
-            defer { try? FileManager.default.removeItem(at: root) }
+            defer { try? removeTemporaryDirectory(at: root) }
             let fileSystem = FaultInjectingFileSystem(rootURL: root)
             let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
             let context = ModelContext(container)
@@ -969,7 +969,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testExportDoesNotIncludeThumbnailAndProviderFailureLeavesCurrentData() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let fileSystem = LocalNoteFileSystem(rootURL: root)
         let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem, inMemory: true)
         let context = ModelContext(container)
@@ -1003,7 +1003,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testProviderFailureVectorsNeverBecomeSuccessfulExport() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let fileSystem = LocalNoteFileSystem(rootURL: root)
         let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem, inMemory: true)
         let context = ModelContext(container)
@@ -1022,7 +1022,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testThumbnailRegenerationFailureDoesNotInvalidateRestore() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let fileSystem = FaultInjectingFileSystem(rootURL: root)
         let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem, inMemory: true)
         let context = ModelContext(container)
@@ -1048,7 +1048,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testRestorePipelineWritesReadableThumbnailForReusedID() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let fileSystem = LocalNoteFileSystem(rootURL: root)
         let startup = NoteStartupController(fileSystem: fileSystem)
         startup.recheck()
@@ -1162,7 +1162,7 @@ final class CornellNoteTests: XCTestCase {
     func testSelectedGenerationMissingOrCorruptNeverCreatesAnEmptyStore() throws {
         for corruption in ["missing-record", "corrupt-record", "missing-store", "unknown-schema"] {
             let root = try makeTemporaryDirectory()
-            defer { try? FileManager.default.removeItem(at: root) }
+            defer { try? removeTemporaryDirectory(at: root) }
             let fileSystem = LocalNoteFileSystem(rootURL: root)
             let selection = NoteStoreSelectionStore(fileSystem: fileSystem)
             let id = UUID().uuidString.lowercased()
@@ -1185,8 +1185,8 @@ final class CornellNoteTests: XCTestCase {
         let root = try makeTemporaryDirectory()
         let outside = try makeTemporaryDirectory()
         defer {
-            try? FileManager.default.removeItem(at: root)
-            try? FileManager.default.removeItem(at: outside)
+            try? removeTemporaryDirectory(at: root)
+            try? removeTemporaryDirectory(at: outside)
         }
         let fileSystem = StartupFaultFileSystem(rootURL: root)
         let record = root.appendingPathComponent("active-store.json")
@@ -1371,7 +1371,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testLocalThumbnailRegenerationDropsOmittedCacheAndWritesActiveDrawing() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let fileSystem = LocalNoteFileSystem(rootURL: root)
         let staleURL = root.appendingPathComponent("thumbnails/stale.png")
         try fileSystem.writeAndFlush(Data([0x55]), to: staleURL)
@@ -1406,7 +1406,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testMarkerWriteFailureRetainsSafetyBackupAndRequiresRecovery() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let fileSystem = FaultInjectingFileSystem(rootURL: root)
         let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem, inMemory: true)
         let context = ModelContext(container)
@@ -1434,7 +1434,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testStrictLoadRejectsUnknownSchemaBeforeEmptyPointerAndPartialMetadata() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let fileSystem = LocalNoteFileSystem(rootURL: root)
         let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
         let context = ModelContext(container)
@@ -1462,7 +1462,7 @@ final class CornellNoteTests: XCTestCase {
         for existing in [false, true] {
             for failure in ["capacity", "write", "read", "checksum", "rename", "commit"] {
                 let root = try makeTemporaryDirectory()
-                defer { try? FileManager.default.removeItem(at: root) }
+                defer { try? removeTemporaryDirectory(at: root) }
                 var committed: SavedNoteSnapshot!
                 do {
                     let fileSystem = FaultInjectingFileSystem(rootURL: root)
@@ -1538,7 +1538,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testTitleOnlyEditCommitsWithVerifiedNonemptyDrawingAndReopens() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         var saved: SavedNoteSnapshot!
         do {
             let fileSystem = LocalNoteFileSystem(rootURL: root)
@@ -1571,7 +1571,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testTitleOnlySaveNeedsNoCapacityOrDrawingWriteAndRollsBackFailedCommit() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         var committed: SavedNoteSnapshot!
         do {
             let fileSystem = FaultInjectingFileSystem(rootURL: root)
@@ -1639,7 +1639,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testDrawingEchoIsNotDirtyAndRealEditsSkipSerialization() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let fileSystem = LocalNoteFileSystem(rootURL: root)
         let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
         let context = ModelContext(container)
@@ -1684,7 +1684,7 @@ final class CornellNoteTests: XCTestCase {
     func testLoadFailuresBlockTitleDrawingAutosaveManualSaveAndLeaveWrites() async throws {
         for failure in ["schema", "partialPointer", "partialChecksum", "path", "missing", "checksum", "decode"] {
             let root = try makeTemporaryDirectory()
-            defer { try? FileManager.default.removeItem(at: root) }
+            defer { try? removeTemporaryDirectory(at: root) }
             var unchanged: SavedNoteSnapshot!
             do {
                 let fileSystem = FaultInjectingFileSystem(rootURL: root)
@@ -1750,7 +1750,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testDebounceUses450msCancelsPreviousEditsAndBackgroundFlushRetriesFailure() async throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let fileSystem = FaultInjectingFileSystem(rootURL: root)
         let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
         let context = ModelContext(container)
@@ -1805,7 +1805,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testLeaveFailureRetainsDraftUntilRetryOrExplicitWarnedDiscard() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let fileSystem = FaultInjectingFileSystem(rootURL: root)
         let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
         let context = ModelContext(container)
@@ -1848,9 +1848,9 @@ final class CornellNoteTests: XCTestCase {
 
     func testStartupGenerationRetainsInjectedFileSystemAcrossRecheck() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let otherRoot = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: otherRoot) }
+        defer { try? removeTemporaryDirectory(at: otherRoot) }
         let fileSystem = LocalNoteFileSystem(rootURL: root)
         let otherFileSystem = LocalNoteFileSystem(rootURL: otherRoot)
         let startup = NoteStartupController(fileSystem: fileSystem)
@@ -1879,7 +1879,7 @@ final class CornellNoteTests: XCTestCase {
     func testStartupNormalAdmissionReadsMarkerBeforeCreatingContainer() throws {
         for marker in [nil, RestoreMarker(recoveryRequired: false, safetyBackupPath: nil, lastFailureState: nil)] {
             let root = try makeTemporaryDirectory()
-            defer { try? FileManager.default.removeItem(at: root) }
+            defer { try? removeTemporaryDirectory(at: root) }
             let markerStore = StartupRecordingMarkerStore()
             markerStore.marker = marker
             var events: [String] = []
@@ -1901,7 +1901,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testStartupRootRecoveryBlocksContainerAndPreservesAllFiles() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let fileSystem = try makeStartupFixture(root: root)
         let marker = RestoreMarker(recoveryRequired: true, safetyBackupPath: "Backups/safety/safety-test", lastFailureState: "post-switch")
         try fileSystem.writeAndFlush(try JSONEncoder().encode(marker), to: root.appendingPathComponent("restore-state.json"))
@@ -1929,7 +1929,7 @@ final class CornellNoteTests: XCTestCase {
         let rewrite = RestoreMarker(recoveryRequired: true, safetyBackupPath: "Backups/safety/safety-test", lastFailureState: "rollback")
         for crashPoint in MarkerCrashPoint.allCases {
             let root = try makeTemporaryDirectory()
-            defer { try? FileManager.default.removeItem(at: root) }
+            defer { try? removeTemporaryDirectory(at: root) }
             let fixture = try makeStartupFixture(root: root)
             let markerURL = root.appendingPathComponent("restore-state.json")
             let safetyURL = root.appendingPathComponent("Backups/safety/safety-test", isDirectory: true)
@@ -1964,7 +1964,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testResolvedMarkerReplacementReopensNormallyWithoutDeletingFirst() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let fixture = try makeStartupFixture(root: root)
         let markerURL = root.appendingPathComponent("restore-state.json")
         let required = RestoreMarker(recoveryRequired: true, safetyBackupPath: "Backups/safety/safety-test", lastFailureState: "post-switch")
@@ -1993,7 +1993,7 @@ final class CornellNoteTests: XCTestCase {
     func testStartupFallbackRecoveryOverridesMissingOrResolvedRoot() throws {
         for hasRootMarker in [false, true] {
             let root = try makeTemporaryDirectory()
-            defer { try? FileManager.default.removeItem(at: root) }
+            defer { try? removeTemporaryDirectory(at: root) }
             let fileSystem = try makeStartupFixture(root: root)
             if hasRootMarker {
                 let resolved = RestoreMarker(recoveryRequired: false, safetyBackupPath: nil, lastFailureState: nil)
@@ -2028,7 +2028,7 @@ final class CornellNoteTests: XCTestCase {
         for path in ["restore-state.json", "Backups/safety/safety-test/recovery-state.json"] {
             for data in invalidMarkers {
                 let root = try makeTemporaryDirectory()
-                defer { try? FileManager.default.removeItem(at: root) }
+                defer { try? removeTemporaryDirectory(at: root) }
                 let fileSystem = try makeStartupFixture(root: root)
                 let resolved = RestoreMarker(recoveryRequired: false, safetyBackupPath: nil, lastFailureState: nil)
                 try fileSystem.writeAndFlush(try JSONEncoder().encode(resolved), to: root.appendingPathComponent("restore-state.json"))
@@ -2058,7 +2058,7 @@ final class CornellNoteTests: XCTestCase {
         for path in ["restore-state.json", "Backups/safety/safety-test/recovery-state.json"] {
             for hidden in [false, true] {
                 let root = try makeTemporaryDirectory()
-                defer { try? FileManager.default.removeItem(at: root) }
+                defer { try? removeTemporaryDirectory(at: root) }
                 let fileSystem = try makeStartupFixture(root: root)
                 let marker = RestoreMarker(recoveryRequired: false, safetyBackupPath: nil, lastFailureState: nil)
                 let url = root.appendingPathComponent(path)
@@ -2087,7 +2087,7 @@ final class CornellNoteTests: XCTestCase {
         for hasRootMarker in [false, true] {
             for hidden in [false, true] {
                 let root = try makeTemporaryDirectory()
-                defer { try? FileManager.default.removeItem(at: root) }
+                defer { try? removeTemporaryDirectory(at: root) }
                 let fileSystem = try makeStartupFixture(root: root)
                 if hasRootMarker {
                     let marker = RestoreMarker(recoveryRequired: false, safetyBackupPath: nil, lastFailureState: nil)
@@ -2116,7 +2116,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testStartupConfirmedAbsenceAllowsFreshInstallWithoutCreatingFilesDuringCheck() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let fileSystem = StartupFaultFileSystem(rootURL: root.appendingPathComponent("not-created"))
         let before = try StartupFileSnapshot(root: root)
         var opens = 0
@@ -2136,7 +2136,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testStartupResolvedFallbacksAndMarkerFreeSafetyBackupsAllowOpenUnchanged() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let fileSystem = try makeStartupFixture(root: root)
         let resolved = RestoreMarker(recoveryRequired: false, safetyBackupPath: "Backups/safety/safety-test", lastFailureState: nil)
         try fileSystem.writeAndFlush(try JSONEncoder().encode(resolved), to: root.appendingPathComponent("restore-state.json"))
@@ -2160,7 +2160,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testStartupStoreOpenFailureRetryAlwaysRepeatsAdmissionWithoutMutatingFiles() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let fileSystem = try makeStartupFixture(root: root)
         let before = try StartupFileSnapshot(root: root)
         fileSystem.mutations.removeAll()
@@ -2190,7 +2190,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testStartupRetryCannotBypassNewRecoveryOrUnreadableMarker() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let markerStore = StartupRecordingMarkerStore()
         var opens = 0
         let startup = NoteStartupController(fileSystem: LocalNoteFileSystem(rootURL: root), markerStore: markerStore) {
@@ -2215,7 +2215,7 @@ final class CornellNoteTests: XCTestCase {
     func testStartupRecheckDropsReadyContainerOnRecoveryReadOrOpenFailure() throws {
         for failure in [NoteStartupFailure.recoveryRequired, .safetyCheckFailed, .storeOpenFailed] {
             let root = try makeTemporaryDirectory()
-            defer { try? FileManager.default.removeItem(at: root) }
+            defer { try? removeTemporaryDirectory(at: root) }
             let fileSystem = try makeStartupFixture(root: root)
             let before = try StartupFileSnapshot(root: root)
             fileSystem.mutations.removeAll()
@@ -2254,7 +2254,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testStartupRetryAfterExternalMarkerRepairDoesNotPerformItsOwnRepair() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let fileSystem = try makeStartupFixture(root: root)
         let markerURL = root.appendingPathComponent("restore-state.json")
         try fileSystem.writeAndFlush(Data("corrupt marker".utf8), to: markerURL)
@@ -2286,7 +2286,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testStartupSuccessfulStoreSwitchGetsNewContainerIdentity() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let fileSystem = LocalNoteFileSystem(rootURL: root)
         let markerStore = StartupRecordingMarkerStore()
         let startup = NoteStartupController(fileSystem: LocalNoteFileSystem(rootURL: root), markerStore: markerStore) {
@@ -2306,7 +2306,7 @@ final class CornellNoteTests: XCTestCase {
     func testStartupDisappearingKnownMarkerOrSafetyDirectoryIsNotConfirmedAbsence() throws {
         for path in ["restore-state.json", "Backups/safety/safety-test/recovery-state.json", "Backups/safety"] {
             let root = try makeTemporaryDirectory()
-            defer { try? FileManager.default.removeItem(at: root) }
+            defer { try? removeTemporaryDirectory(at: root) }
             let fileSystem = try makeStartupFixture(root: root)
             let url = root.appendingPathComponent(path)
             if path == "Backups/safety" {
@@ -2336,7 +2336,7 @@ final class CornellNoteTests: XCTestCase {
 
     func testStartupRevokesOldAdmissionBeforeMarkerReadAndCreatesNewGenerationOnlyAfterOpen() throws {
         let root = try makeTemporaryDirectory()
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? removeTemporaryDirectory(at: root) }
         let markerStore = StartupRecordingMarkerStore()
         var oldAdmission: NoteWriteAdmission?
         let startup = NoteStartupController(fileSystem: LocalNoteFileSystem(rootURL: root), markerStore: markerStore) {
@@ -2370,7 +2370,7 @@ final class CornellNoteTests: XCTestCase {
         for failure in [NoteStartupFailure.recoveryRequired, .safetyCheckFailed, .storeOpenFailed] {
             for timerOrder in ["timerFirst", "teardownFirst", "afterSuccessfulRetry"] {
                 let root = try makeTemporaryDirectory()
-                defer { try? FileManager.default.removeItem(at: root) }
+                defer { try? removeTemporaryDirectory(at: root) }
                 let fileSystem = StartupFaultFileSystem(rootURL: root)
                 let markerURL = root.appendingPathComponent("restore-state.json")
                 let fallbackURL = root.appendingPathComponent("Backups/safety/safety-test/recovery-state.json")
@@ -2630,6 +2630,47 @@ final class CornellNoteTests: XCTestCase {
             ),
             path
         )
+    }
+
+    func testTemporaryCleanupPreservesOpenLegacyAndGenerationStores() throws {
+        for relativePath in ["", "generations/\(UUID().uuidString.lowercased())"] {
+            let root = try makeTemporaryDirectory()
+            let storeRoot = relativePath.isEmpty ? root : root.appendingPathComponent(relativePath)
+            let fileSystem = LocalNoteFileSystem(rootURL: storeRoot)
+            let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
+            let context = ModelContext(container)
+            context.autosaveEnabled = false
+            let note = NoteRecord(title: "Retained fixture")
+            context.insert(note)
+            try context.save()
+
+            try removeTemporaryDirectory(at: root)
+
+            let storeExists = FileManager.default.fileExists(atPath: storeRoot.appendingPathComponent("metadata.store").path)
+            XCTAssertTrue(storeExists, "Cleanup must not unlink an open SQLite store or its parent")
+            guard storeExists else { continue }
+            note.title = "Still writable"
+            try context.save()
+            let reopened = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
+            XCTAssertEqual(try ModelContext(reopened).fetch(FetchDescriptor<NoteRecord>()).first?.title, "Still writable")
+        }
+    }
+
+    func testTemporaryCleanupRemovesFixturesWithoutSQLiteStores() throws {
+        let root = try makeTemporaryDirectory()
+        try Data([1, 2, 3]).write(to: root.appendingPathComponent("drawing.bin"))
+
+        try removeTemporaryDirectory(at: root)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.path))
+    }
+
+    private func removeTemporaryDirectory(at url: URL) throws {
+        let paths = try FileManager.default.subpathsOfDirectory(atPath: url.path)
+        // SwiftData can retain open SQLite handles beyond the test method's lifetime.
+        // Keep disk fixtures (including their parents) until the test host exits.
+        guard !paths.contains(where: { ($0 as NSString).lastPathComponent.hasPrefix("metadata.store") }) else { return }
+        try FileManager.default.removeItem(at: url)
     }
 
     private func makeTemporaryDirectory() throws -> URL {
