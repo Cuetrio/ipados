@@ -35,10 +35,12 @@ enum NoteStartupState {
 @MainActor
 struct NoteStoreGeneration {
     let container: ModelContainer
+    let fileSystem: BackupFileSystem
     let writeAdmission: NoteWriteAdmission
 
-    fileprivate init(container: ModelContainer) {
+    fileprivate init(container: ModelContainer, fileSystem: BackupFileSystem) {
         self.container = container
+        self.fileSystem = fileSystem
         writeAdmission = NoteWriteAdmission()
     }
 }
@@ -48,7 +50,24 @@ struct NoteStoreGeneration {
 final class NoteWriteAdmission {
     private(set) var isAllowed = true
 
+    private var sessions: [WeakSession] = []
+    private final class WeakSession {
+        weak var value: NoteEditingSession?
+        init(_ value: NoteEditingSession) { self.value = value }
+    }
+
     fileprivate init() {}
+
+    func register(_ session: NoteEditingSession) {
+        sessions.removeAll { $0.value == nil }
+        sessions.append(WeakSession(session))
+    }
+
+    var canRestore: Bool {
+        isAllowed && !sessions.contains {
+            $0.value.map { $0.hasUnsavedChanges || $0.isDrawingStrokeInProgress } ?? false
+        }
+    }
 
     fileprivate func revoke() {
         isAllowed = false
@@ -59,21 +78,76 @@ final class NoteWriteAdmission {
 @Observable
 final class NoteStartupController {
     private(set) var state: NoteStartupState = .checking
+    let fileSystem: BackupFileSystem
     private let markerStore: RestoreMarkerStore
-    private let makeContainer: () throws -> ModelContainer
+    private let makeContainer: (() throws -> ModelContainer)?
+    private let openSelectedContainer: @MainActor (BackupFileSystem) throws -> ModelContainer
+    private var preparedGeneration: NoteStoreGeneration?
+    private var recoveryIsLatched = false
+    private(set) var isRestoring = false
 
-    init(markerStore: RestoreMarkerStore, makeContainer: @escaping () throws -> ModelContainer) {
-        self.markerStore = markerStore
-        self.makeContainer = makeContainer
+    var canRestore: Bool {
+        guard !isRestoring, case .ready(let generation) = state else { return false }
+        return generation.writeAdmission.canRestore
     }
 
-    convenience init(fileSystem: BackupFileSystem) {
-        self.init(markerStore: LocalRestoreMarkerStore(fileSystem: fileSystem)) {
-            try NotePersistenceController.makeContainer(fileSystem: fileSystem)
+    func beginRestore() throws {
+        guard canRestore, case .ready(let generation) = state else {
+            throw BackupRestoreError.restoreUnavailable
+        }
+        generation.writeAdmission.revoke()
+        generation.container.mainContext.autosaveEnabled = false
+        isRestoring = true
+    }
+
+    func prepareRestoredGeneration() throws {
+        guard isRestoring else { throw BackupRestoreError.restoreUnavailable }
+        let selected = try NoteStoreSelectionStore(fileSystem: fileSystem).selectedFileSystem()
+        let container = try openSelectedContainer(selected)
+        container.mainContext.autosaveEnabled = false
+        preparedGeneration = NoteStoreGeneration(container: container, fileSystem: selected)
+    }
+
+    func finishRestore(recoveryRequired: Bool = false) {
+        isRestoring = false
+        recoveryIsLatched = recoveryIsLatched || recoveryRequired
+        if recoveryIsLatched {
+            preparedGeneration?.writeAdmission.revoke()
+            preparedGeneration = nil
+            state = .blocked(.recoveryRequired)
+        } else if let prepared = preparedGeneration {
+            preparedGeneration = nil
+            // The restore pipeline committed marker resolution after all disk
+            // checks. Publish its retained container without post-commit I/O.
+            state = .ready(prepared)
+        } else {
+            recheck()
         }
     }
 
+    init(fileSystem: BackupFileSystem, markerStore: RestoreMarkerStore, makeContainer: @escaping () throws -> ModelContainer) {
+        self.fileSystem = fileSystem
+        self.markerStore = markerStore
+        self.makeContainer = makeContainer
+        openSelectedContainer = { try NotePersistenceController.makeContainer(fileSystem: $0) }
+    }
+
+    init(fileSystem: BackupFileSystem,
+         openSelectedContainer: @escaping @MainActor (BackupFileSystem) throws -> ModelContainer = {
+             try NotePersistenceController.makeContainer(fileSystem: $0)
+         }) {
+        self.fileSystem = fileSystem
+        markerStore = LocalRestoreMarkerStore(fileSystem: fileSystem)
+        makeContainer = nil
+        self.openSelectedContainer = openSelectedContainer
+    }
+
     func recheck() {
+        guard !isRestoring else { return }
+        guard !recoveryIsLatched else {
+            state = .blocked(.recoveryRequired)
+            return
+        }
         // Revoke before teardown can flush the old editor. A later open gets a new token.
         if case .ready(let generation) = state {
             generation.writeAdmission.revoke()
@@ -90,8 +164,18 @@ final class NoteStartupController {
         }
 
         do {
-            let container = try makeContainer()
-            state = .ready(NoteStoreGeneration(container: container))
+            let selectedFileSystem: BackupFileSystem
+            let container: ModelContainer
+            if let makeContainer {
+                selectedFileSystem = fileSystem
+                container = try makeContainer()
+            } else {
+                selectedFileSystem = try NoteStoreSelectionStore(fileSystem: fileSystem)
+                    .selectedFileSystem(allowFreshLegacy: true)
+                container = try openSelectedContainer(selectedFileSystem)
+            }
+            container.mainContext.autosaveEnabled = false
+            state = .ready(NoteStoreGeneration(container: container, fileSystem: selectedFileSystem))
         } catch {
             state = .blocked(.storeOpenFailed)
         }

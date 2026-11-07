@@ -49,10 +49,10 @@ struct EditorView: View {
 
                 GeometryReader { proxy in
                     // The canvas draws the Cornell background itself so it zooms with the ink.
-                    CanvasView(canvasView: canvasView, isEditable: session.canEdit) { drawing in
+                    CanvasView(canvasView: canvasView, isEditable: session.canEdit, onDrawingChanged: { drawing in
                         session.updateDrawing(drawing)
                         refreshHistoryState()
-                    }
+                    }, onStrokeChanged: { session.setDrawingStrokeInProgress($0) })
                     .padding()
                     .frame(width: proxy.size.width, height: proxy.size.height)
                 }

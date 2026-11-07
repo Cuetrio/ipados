@@ -10,6 +10,11 @@ final class NoteEditingSession {
     var canEdit: Bool { canWrite() && loadState == .loaded }
     private var loadState: DrawingLoadState = .notLoaded
     private(set) var hasUnsavedChanges = false
+    private(set) var isDrawingStrokeInProgress = false
+
+    func setDrawingStrokeInProgress(_ value: Bool) {
+        isDrawingStrokeInProgress = value
+    }
     /// Only drawing edits need a new drawing generation; title-only saves keep the active one.
     private var hasUnsavedDrawing = false
     private(set) var saveState: NoteSaveState = .saved

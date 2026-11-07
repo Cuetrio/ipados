@@ -1,6 +1,21 @@
 import XCTest
 
 final class SettingsBackupUITests: XCTestCase {
+    func testRestoreIsAvailableAfterSafeStartup() {
+        let app = XCUIApplication()
+        app.launchEnvironment["CORNELL_NOTE_UI_TEST_STORE"] = UUID().uuidString
+        app.launch()
+        let settings = app.buttons["設定 / バックアップ"]
+        XCTAssertTrue(settings.waitForExistence(timeout: 10))
+        settings.tap()
+        let restore = app.buttons["バックアップを読み込む"]
+        XCTAssertTrue(restore.waitForExistence(timeout: 5))
+        XCTAssertTrue(restore.isEnabled)
+        restore.tap()
+        XCTAssertTrue(app.alerts["すべてのノートを置き換えますか？"].waitForExistence(timeout: 5))
+        app.alerts.buttons["キャンセル"].tap()
+    }
+
     func testLatestNoteDateRemainsAfterRelaunch() {
         let app = XCUIApplication()
         app.launchEnvironment["CORNELL_NOTE_UI_TEST_STORE"] = UUID().uuidString
@@ -45,7 +60,9 @@ final class SettingsBackupUITests: XCTestCase {
         XCTAssertEqual(date.label, "現存ノートの最新更新日時")
         XCTAssertEqual(date.value as? String, "確認できません")
         XCTAssertTrue(app.buttons["バックアップを書き出す"].exists)
-        app.buttons["バックアップを読み込む"].tap()
+        let restore = app.buttons["バックアップを読み込む"]
+        XCTAssertTrue(restore.isEnabled)
+        restore.tap()
         XCTAssertTrue(app.alerts["すべてのノートを置き換えますか？"].waitForExistence(timeout: 5))
         app.alerts.buttons["キャンセル"].tap()
         XCTAssertTrue(app.buttons["バックアップを読み込む"].exists)

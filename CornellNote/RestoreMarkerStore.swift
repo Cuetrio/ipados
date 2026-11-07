@@ -43,6 +43,7 @@ struct RestoreMarker: Codable, Equatable {
 
 protocol RestoreMarkerStore: AnyObject {
     func read() throws -> RestoreMarker?
+    // A resolved write verifies disk state before committing removal of pending intent.
     func write(_ marker: RestoreMarker, fallbackDirectory: URL?) throws
 }
 
@@ -104,7 +105,12 @@ final class LocalRestoreMarkerStore: RestoreMarkerStore {
         do {
             try writeAtomically(data, to: markerURL)
             if !marker.recoveryRequired {
-                clearResolvedFallbackMarkers()
+                // Keep pending intent until all reads have succeeded. Removing the
+                // last fallback commits resolution; callers must not re-read afterward.
+                guard try readMarkerIfPresent(at: markerURL) == marker else {
+                    throw BackupEnvelopeError.footerHashMismatch
+                }
+                try clearResolvedFallbackMarkers()
             }
         } catch {
             if let fallbackDirectory {
@@ -132,18 +138,27 @@ final class LocalRestoreMarkerStore: RestoreMarkerStore {
         try JSONDecoder().decode(RestoreMarker.self, from: data)
     }
 
-    private func clearResolvedFallbackMarkers() {
+    private func clearResolvedFallbackMarkers() throws {
         let safetyRoot = BackupManagedPaths.safetyRoot(for: fileSystem)
-        guard let directories = try? fileSystem.contentsOfDirectory(at: safetyRoot) else { return }
-        for directory in directories where directory.lastPathComponent.hasPrefix("safety-") {
+        let wasPresent = fileSystem.fileExists(at: safetyRoot)
+        let directories: [URL]
+        do {
+            directories = try fileSystem.contentsOfDirectory(at: safetyRoot)
+        } catch {
+            guard !wasPresent, isMissingFile(error) else { throw error }
+            return
+        }
+        var pending: [URL] = []
+        for directory in directories {
             let fallbackURL = directory.appendingPathComponent("recovery-state.json")
-            guard fileSystem.fileExists(at: fallbackURL),
-                  let data = try? fileSystem.readData(at: fallbackURL),
-                  let marker = try? decode(data),
-                  marker.recoveryRequired else {
-                continue
+            if try readMarkerIfPresent(at: fallbackURL)?.recoveryRequired == true {
+                pending.append(fallbackURL)
             }
-            try? fileSystem.removeItem(at: fallbackURL)
+        }
+        // Finish every fallible inspection before deleting any pending intent.
+        // A failed removal leaves at least that fallback available on restart.
+        for fallbackURL in pending {
+            try fileSystem.removeItem(at: fallbackURL)
         }
     }
 }

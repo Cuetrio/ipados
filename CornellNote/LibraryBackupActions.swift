@@ -5,7 +5,9 @@ import UniformTypeIdentifiers
 @MainActor
 struct LibraryBackupActions: ViewModifier {
     @Environment(\.modelContext) private var modelContext
+    let fileSystem: BackupFileSystem
     let writeAdmission: NoteWriteAdmission
+    let startup: NoteStartupController
     let hasRetainedDraft: Bool
     let saveState: NoteSaveState
     let lastSaved: Date?
@@ -55,7 +57,10 @@ struct LibraryBackupActions: ViewModifier {
                             Button("バックアップを書き出す", action: beginBackupExport)
                                 .disabled(hasRetainedDraft || !writeAdmission.isAllowed)
                             Button("バックアップを読み込む") { isConfirmingRestore = true }
-                                .disabled(hasRetainedDraft || !writeAdmission.isAllowed)
+                                .disabled(!startup.canRestore)
+                            if !startup.canRestore {
+                                Text("すべてのウィンドウで描画を終え、未保存の変更を保存または破棄してから復元してください。")
+                            }
                             if hasRetainedDraft {
                                 Text("未保存の変更を保存または破棄してからバックアップを操作してください。")
                             }
@@ -122,7 +127,7 @@ struct LibraryBackupActions: ViewModifier {
     }
 
     private func refreshCapacity() {
-        let root = LocalNoteFileSystem().rootURL
+        let root = fileSystem.rootURL
         capacity = try? root.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
             .volumeAvailableCapacityForImportantUsage
     }
@@ -130,7 +135,7 @@ struct LibraryBackupActions: ViewModifier {
     private func beginBackupExport() {
         guard writeAdmission.isAllowed, !hasRetainedDraft else { return }
         do {
-            let coordinator = BackupExportCoordinator(modelContext: modelContext, fileSystem: LocalNoteFileSystem())
+            let coordinator = BackupExportCoordinator(modelContext: modelContext, fileSystem: fileSystem)
             backupDocument = CornellNoteBackupDocument(data: try coordinator.makeVerifiedEnvelope())
             isExportingBackup = true
         } catch {
@@ -146,12 +151,9 @@ struct LibraryBackupActions: ViewModifier {
         }
         let didStartAccessing = url.startAccessingSecurityScopedResource()
         defer { if didStartAccessing { url.stopAccessingSecurityScopedResource() } }
-        let coordinator = BackupRestoreCoordinator(modelContext: modelContext, fileSystem: LocalNoteFileSystem())
+        let coordinator = BackupRestoreCoordinator(modelContext: modelContext, fileSystem: fileSystem, startup: startup)
         let restoreResult = try? coordinator.restore(from: url, provider: LocalDocumentProviderAdapter())
         restoreState = restoreResult?.state ?? .restoreFailed
-        if restoreResult?.state == .completed || restoreResult?.state == .recoveryRequired {
-            NotificationCenter.default.post(name: .cornellNoteStoreDidSwitch, object: nil)
-        }
         if restoreResult == nil { transferError = "バックアップを読み込めませんでした。" }
     }
 

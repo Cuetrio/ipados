@@ -15,7 +15,9 @@ struct LibraryView: View {
         editingSession?.hasUnsavedChanges == true
     }
 
+    let fileSystem: BackupFileSystem
     let writeAdmission: NoteWriteAdmission
+    let startup: NoteStartupController
 
     var body: some View {
         NavigationStack {
@@ -34,7 +36,7 @@ struct LibraryView: View {
                     } label: {
                         VStack(alignment: .leading, spacing: 4) {
                             HStack(spacing: 12) {
-                                NoteThumbnailView(note: note, writeAdmission: writeAdmission)
+                                NoteThumbnailView(note: note, fileSystem: fileSystem, writeAdmission: writeAdmission)
                                 VStack(alignment: .leading, spacing: 4) {
                                     Text(note.displayTitle)
                                         .font(.headline)
@@ -91,7 +93,9 @@ struct LibraryView: View {
                 Text("削除したノートは元に戻せません。")
             }
             .modifier(LibraryBackupActions(
+                fileSystem: fileSystem,
                 writeAdmission: writeAdmission,
+                startup: startup,
                 hasRetainedDraft: hasRetainedDraft,
                 saveState: editingSession?.saveState ?? .saved,
                 lastSaved: notes.first?.updatedAt,
@@ -99,9 +103,9 @@ struct LibraryView: View {
             ))
             .task {
                 guard writeAdmission.isAllowed else { return }
-                let persistence = NotePersistenceController(modelContext: modelContext)
+                let persistence = NotePersistenceController(modelContext: modelContext, fileSystem: fileSystem, canWrite: { [writeAdmission] in writeAdmission.isAllowed })
                 notes.forEach { persistence.cleanupOrphans(for: $0) }
-                let coordinator = BackupRestoreCoordinator(modelContext: modelContext, fileSystem: LocalNoteFileSystem())
+                let coordinator = BackupRestoreCoordinator(modelContext: modelContext, fileSystem: fileSystem)
                 if coordinator.recoveryMarker()?.recoveryRequired == true {
                     restoreState = .recoveryRequired
                 }
@@ -114,9 +118,10 @@ struct LibraryView: View {
         if !hasRetainedDraft {
             editingSession = NoteEditingSession(
                 note: note,
-                persistence: NotePersistenceController(modelContext: modelContext),
+                persistence: NotePersistenceController(modelContext: modelContext, fileSystem: fileSystem, canWrite: { [writeAdmission] in writeAdmission.isAllowed }),
                 canWrite: { [writeAdmission] in writeAdmission.isAllowed }
             )
+            if let editingSession { writeAdmission.register(editingSession) }
         }
         isEditorPresented = true
     }
@@ -135,7 +140,7 @@ struct LibraryView: View {
     private func deleteSelectedNote() {
         guard writeAdmission.isAllowed, !hasRetainedDraft, let note = noteToDelete else { return }
         do {
-            try NotePersistenceController(modelContext: modelContext).delete(note: note)
+            try NotePersistenceController(modelContext: modelContext, fileSystem: fileSystem, canWrite: { [writeAdmission] in writeAdmission.isAllowed }).delete(note: note)
         } catch {
             noteToDelete = nil
         }
@@ -145,6 +150,7 @@ struct LibraryView: View {
 private struct NoteThumbnailView: View {
     @Environment(\.modelContext) private var modelContext
     let note: NoteRecord
+    let fileSystem: BackupFileSystem
     let writeAdmission: NoteWriteAdmission
     @State private var image: UIImage?
 
@@ -168,7 +174,7 @@ private struct NoteThumbnailView: View {
     private func loadThumbnail() {
         image = nil
         guard writeAdmission.isAllowed else { return }
-        let persistence = NotePersistenceController(modelContext: modelContext)
+        let persistence = NotePersistenceController(modelContext: modelContext, fileSystem: fileSystem, canWrite: { [writeAdmission] in writeAdmission.isAllowed })
         image = persistence.thumbnailImage(for: note)
     }
 }

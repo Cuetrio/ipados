@@ -36,13 +36,14 @@ struct CanvasView: UIViewRepresentable {
     let canvasView: NoteCanvasView
     var isEditable = true
     var onDrawingChanged: (PKDrawing) -> Void = { _ in }
+    var onStrokeChanged: (Bool) -> Void = { _ in }
 
     /// PencilKit stores ink in its light-appearance color and adapts it for dark mode itself,
     /// so the default pen is plain black (shown white in dark mode), not a dynamic color.
     static let initialTool = PKInkingTool(.pen, color: .black, width: 3)
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(onDrawingChanged: onDrawingChanged)
+        Coordinator(onDrawingChanged: onDrawingChanged, onStrokeChanged: onStrokeChanged)
     }
 
     func makeUIView(context: Context) -> NoteCanvasView {
@@ -94,8 +95,20 @@ struct CanvasView: UIViewRepresentable {
         let toolPicker = PKToolPicker()
         var appliedEditable: Bool?
 
-        init(onDrawingChanged: @escaping (PKDrawing) -> Void) {
+        let onStrokeChanged: (Bool) -> Void
+
+        init(onDrawingChanged: @escaping (PKDrawing) -> Void, onStrokeChanged: @escaping (Bool) -> Void) {
             self.onDrawingChanged = onDrawingChanged
+            self.onStrokeChanged = onStrokeChanged
+        }
+
+        func canvasViewDidBeginUsingTool(_ canvasView: PKCanvasView) {
+            onStrokeChanged(true)
+        }
+
+        func canvasViewDidEndUsingTool(_ canvasView: PKCanvasView) {
+            onDrawingChanged(canvasView.drawing)
+            onStrokeChanged(false)
         }
 
         func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {

@@ -131,16 +131,24 @@ final class NotePersistenceController {
     let fileSystem: NoteFileSystem
     var clock: () -> Date
     private let commitMetadata: () throws -> Void
+    private let canWrite: () -> Bool
+    private let renderThumbnail: (PKDrawing) -> UIImage
 
     init(
         modelContext: ModelContext,
         fileSystem: NoteFileSystem = LocalNoteFileSystem(),
         clock: @escaping () -> Date = { .now },
-        commitMetadata: (() throws -> Void)? = nil
+        commitMetadata: (() throws -> Void)? = nil,
+        canWrite: @escaping () -> Bool = { true },
+        renderThumbnail: @escaping (PKDrawing) -> UIImage = {
+            $0.image(from: CGRect(x: 0, y: 0, width: 1200, height: 900), scale: 1)
+        }
     ) {
         self.modelContext = modelContext
         self.fileSystem = fileSystem
         self.clock = clock
+        self.canWrite = canWrite
+        self.renderThumbnail = renderThumbnail
         self.commitMetadata = commitMetadata ?? { try modelContext.save() }
     }
 
@@ -160,6 +168,7 @@ final class NotePersistenceController {
     }
 
     func save(note: NoteRecord, drawing: PKDrawing, title: String? = nil) throws {
+        guard canWrite() else { throw BackupRestoreError.restoreUnavailable }
         let data = drawing.dataRepresentation()
         let drawingDirectory = drawingsDirectory(for: note)
         try fileSystem.createDirectory(at: drawingDirectory)
@@ -215,6 +224,7 @@ final class NotePersistenceController {
     /// Commits a title change while keeping the verified active drawing generation.
     /// No drawing bytes are serialized, written, or copied, so no capacity is required.
     func saveTitle(note: NoteRecord, title: String) throws {
+        guard canWrite() else { throw BackupRestoreError.restoreUnavailable }
         guard note.drawingSchemaVersion == Self.drawingSchemaVersion else {
             throw NotePersistenceError.unsupportedDrawingSchema
         }
@@ -279,11 +289,12 @@ final class NotePersistenceController {
 
     @discardableResult
     func regenerateThumbnail(for note: NoteRecord, drawing: PKDrawing) throws -> URL {
-        let image = drawing.image(from: CGRect(x: 0, y: 0, width: 1200, height: 900), scale: 1)
+        let image = renderThumbnail(drawing)
         return try storeThumbnail(image, for: note)
     }
 
     private func storeThumbnail(_ image: UIImage, for note: NoteRecord) throws -> URL {
+        guard canWrite() else { throw BackupRestoreError.restoreUnavailable }
         let directory = thumbnailDirectory(for: note)
         try fileSystem.createDirectory(at: directory)
         let url = thumbnailURL(for: note)
@@ -315,12 +326,13 @@ final class NotePersistenceController {
             return image
         }
         guard let drawing = try? loadDrawing(for: note) else { return nil }
-        let image = drawing.image(from: CGRect(x: 0, y: 0, width: 1200, height: 900), scale: 1)
+        let image = renderThumbnail(drawing)
         _ = try? storeThumbnail(image, for: note)
         return image
     }
 
     func delete(note: NoteRecord) throws {
+        guard canWrite() else { throw BackupRestoreError.restoreUnavailable }
         modelContext.delete(note)
         do {
             try commitMetadata()
@@ -334,6 +346,7 @@ final class NotePersistenceController {
     }
 
     func cleanupOrphans(for note: NoteRecord) {
+        guard canWrite() else { return }
         // Invalid metadata must not turn the last good generation into a deletable orphan.
         guard (try? loadDrawing(for: note)) != nil else { return }
         let directory = drawingsDirectory(for: note)

@@ -7,6 +7,65 @@ import XCTest
 
 @MainActor
 final class CornellNoteTests: XCTestCase {
+    func testDiskMetadataTransactionCommitAndRollbackObservations() throws {
+        enum InjectedFailure: Error { case afterInsert }
+
+        for shouldFail in [false, true] {
+            let root = try makeTemporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let fileSystem = LocalNoteFileSystem(rootURL: root)
+            let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
+            let oldContext = ModelContext(container)
+            oldContext.autosaveEnabled = false
+            let oldShared = NoteRecord(title: "Old shared")
+            let oldRemoved = NoteRecord(title: "Old removed")
+            let sharedID = oldShared.id
+            let removedID = oldRemoved.id
+            oldContext.insert(oldShared)
+            oldContext.insert(oldRemoved)
+            try oldContext.save()
+            // Materialize records in the old context before the other context writes.
+            XCTAssertEqual(try oldContext.fetch(FetchDescriptor<NoteRecord>()).count, 2)
+
+            let writer = ModelContext(container)
+            writer.autosaveEnabled = false
+            let oldRecords = try writer.fetch(FetchDescriptor<NoteRecord>())
+            XCTAssertEqual(oldRecords.count, 2)
+            let newShared = NoteRecord(title: "New shared")
+            newShared.id = sharedID
+            let newAdded = NoteRecord(title: "New added")
+            let addedID = newAdded.id
+            var caughtInjectedFailure = false
+            do {
+                try writer.transaction {
+                    for record in oldRecords { writer.delete(record) }
+                    writer.insert(newShared)
+                    writer.insert(newAdded)
+                    if shouldFail { throw InjectedFailure.afterInsert }
+                }
+            } catch InjectedFailure.afterInsert {
+                caughtInjectedFailure = true
+                writer.rollback()
+            }
+            XCTAssertEqual(caughtInjectedFailure, shouldFail)
+
+            let freshContext = ModelContext(container)
+            freshContext.autosaveEnabled = false
+            let freshRecords = try freshContext.fetch(FetchDescriptor<NoteRecord>())
+            let freshTitles = Dictionary(uniqueKeysWithValues: freshRecords.map { ($0.id, $0.title) })
+            XCTAssertEqual(freshRecords.count, 2)
+            if shouldFail {
+                XCTAssertEqual(freshTitles, [sharedID: "Old shared", removedID: "Old removed"])
+            } else {
+                XCTAssertEqual(freshTitles, [sharedID: "New shared", addedID: "New added"])
+            }
+            let oldRecordsAfter = try oldContext.fetch(FetchDescriptor<NoteRecord>())
+            let oldObservation = oldRecordsAfter.map { "\($0.id.uuidString):\($0.title)" }.sorted()
+            let freshObservation = freshRecords.map { "\($0.id.uuidString):\($0.title)" }.sorted()
+            print("Metadata transaction injected failure=\(shouldFail); old retained shared title=\(oldShared.title); old context=\(oldObservation); fresh context=\(freshObservation)")
+        }
+    }
+
     func testCapacityDisplayDoesNotReportUnknownAsAvailable() {
         XCTAssertEqual(LibraryBackupActions.capacityLabel(nil), "取得できません")
         XCTAssertEqual(LibraryBackupActions.capacityLabel(-1), "取得できません")
@@ -279,6 +338,42 @@ final class CornellNoteTests: XCTestCase {
         XCTAssertNotNil(UIImage(data: try XCTUnwrap(reopenedController.thumbnailData(for: reopened))))
     }
 
+    func testThumbnailRendersOnceOnMissOrCorruptionAndNeverOnHit() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileSystem = FaultInjectingFileSystem(rootURL: root)
+        let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
+        let context = container.mainContext
+        let note = NoteRecord(title: "Current")
+        context.insert(note)
+        try context.save()
+        var renderCount = 0
+        let controller = NotePersistenceController(modelContext: context, fileSystem: fileSystem, renderThumbnail: {
+            renderCount += 1
+            return $0.image(from: CGRect(x: 0, y: 0, width: 1200, height: 900), scale: 1)
+        })
+        try controller.save(note: note, drawing: nonemptyDrawing(offset: 20))
+        let metadata = BackupMetadata(noteRecords: [note])
+        let drawing = try controller.loadDrawing(for: note).dataRepresentation()
+        fileSystem.failNextWrite = true
+        XCTAssertNotNil(controller.thumbnailImage(for: note))
+        XCTAssertEqual(renderCount, 1)
+        XCTAssertNil(try controller.thumbnailData(for: note))
+        XCTAssertNotNil(controller.thumbnailImage(for: note))
+        XCTAssertEqual(renderCount, 2)
+        XCTAssertNotNil(controller.thumbnailImage(for: note))
+        XCTAssertEqual(renderCount, 2)
+        let url = NotePersistenceController.thumbnailURL(root: root, id: note.id, schemaVersion: note.drawingSchemaVersion,
+            fileName: note.drawingFileName, checksum: note.drawingChecksum)
+        try fileSystem.writeAndFlush(Data([0xff]), to: url)
+        XCTAssertNotNil(controller.thumbnailImage(for: note))
+        XCTAssertEqual(renderCount, 3)
+        XCTAssertNotNil(controller.thumbnailImage(for: note))
+        XCTAssertEqual(renderCount, 3)
+        XCTAssertEqual(BackupMetadata(noteRecords: [note]), metadata)
+        XCTAssertEqual(try controller.loadDrawing(for: note).dataRepresentation(), drawing)
+    }
+
     func testThumbnailFailureDoesNotChangeSavedDrawingOrFailedDraft() throws {
         let root = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -522,6 +617,122 @@ final class CornellNoteTests: XCTestCase {
         XCTAssertEqual(try LocalRestoreMarkerStore(fileSystem: fileSystem).read(), marker)
     }
 
+    func testLocalRestoreRefusesBeforeTouchingTwoSceneDraftsOrTheirOpenStores() throws {
+        // Keep this disposable disk store: SwiftData does not expose a verified close operation.
+        let root = try makeTemporaryDirectory()
+        let fileSystem = StartupFaultFileSystem(rootURL: root)
+        let firstContainer = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
+        let firstContext = ModelContext(firstContainer)
+        firstContext.autosaveEnabled = false
+        let firstNote = NoteRecord(title: "First")
+        let secondNote = NoteRecord(title: "Second")
+        firstContext.insert(firstNote)
+        firstContext.insert(secondNote)
+        try firstContext.save()
+        let persistence = NotePersistenceController(modelContext: firstContext, fileSystem: fileSystem)
+        try persistence.save(note: firstNote, drawing: nonemptyDrawing(offset: 0))
+        let drawingURL = root.appendingPathComponent(try XCTUnwrap(firstNote.drawingFileName))
+        let drawingBefore = try Data(contentsOf: drawingURL)
+        let thumbnailURL = try persistence.regenerateThumbnail(for: firstNote, drawing: persistence.loadDrawing(for: firstNote))
+        let thumbnailBefore = try Data(contentsOf: thumbnailURL)
+
+        // Separate containers and editing sessions model two windows, not the SwiftUI scene lifecycle.
+        let secondContainer = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
+        let secondContext = ModelContext(secondContainer)
+        secondContext.autosaveEnabled = false
+        let secondSceneNote = try XCTUnwrap(try secondContext.fetch(FetchDescriptor<NoteRecord>()).first { $0.id == secondNote.id })
+        let firstSession = NoteEditingSession(note: firstNote, persistence: persistence)
+        let secondSession = NoteEditingSession(
+            note: secondSceneNote,
+            persistence: NotePersistenceController(modelContext: secondContext, fileSystem: fileSystem)
+        )
+        firstSession.updateTitle("First draft")
+        secondSession.updateTitle("Second draft")
+        firstSession.updateDrawing(nonemptyDrawing(offset: 100))
+        let firstDraft = firstSession.drawingDraft.dataRepresentation()
+        let imported = try makeSimpleBackupData(title: "Imported")
+        let provider = RecordingDocumentProvider()
+        let startup = NoteStartupController(fileSystem: fileSystem, markerStore: LocalRestoreMarkerStore(fileSystem: fileSystem)) { firstContainer }
+        startup.recheck()
+        guard case .ready(let generation) = startup.state else { return XCTFail("Store did not open") }
+        generation.writeAdmission.register(firstSession)
+        generation.writeAdmission.register(secondSession)
+        let coordinator = BackupRestoreCoordinator(modelContext: firstContext, fileSystem: fileSystem, startup: startup)
+        fileSystem.mutations.removeAll()
+
+        for data in [imported, Data([0xff])] {
+            let result = coordinator.restore(from: data)
+            XCTAssertEqual(result.state, .restoreFailed)
+            XCTAssertEqual(result.phase, .selected)
+            XCTAssertEqual(result.errorDescription, BackupRestoreError.restoreUnavailable.localizedDescription)
+            XCTAssertNil(result.safetyBackupURL)
+        }
+        let providerResult = try coordinator.restore(from: root.appendingPathComponent("not-read"), provider: provider)
+        XCTAssertEqual(providerResult.state, .restoreFailed)
+        XCTAssertFalse(provider.didReadImportedFile)
+        XCTAssertTrue(fileSystem.mutations.isEmpty)
+        XCTAssertEqual(try Data(contentsOf: drawingURL), drawingBefore)
+        XCTAssertEqual(try Data(contentsOf: thumbnailURL), thumbnailBefore)
+        XCTAssertEqual(firstNote.title, "First")
+        XCTAssertEqual(secondSceneNote.title, "Second")
+        XCTAssertEqual(firstSession.titleDraft, "First draft")
+        XCTAssertEqual(secondSession.titleDraft, "Second draft")
+        XCTAssertEqual(firstSession.drawingDraft.dataRepresentation(), firstDraft)
+        XCTAssertTrue(firstSession.hasUnsavedChanges)
+        XCTAssertTrue(secondSession.hasUnsavedChanges)
+        XCTAssertTrue(firstSession.canEdit)
+        XCTAssertTrue(secondSession.canEdit)
+
+        firstSession.flushSave()
+        secondSession.flushSave()
+        XCTAssertEqual(firstSession.saveState, .saved)
+        XCTAssertEqual(secondSession.saveState, .saved)
+        let reopened = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
+        let reopenedContext = ModelContext(reopened)
+        XCTAssertEqual(
+            try reopenedContext.fetch(FetchDescriptor<NoteRecord>()).map(\.title).sorted(),
+            ["First draft", "Second draft"]
+        )
+    }
+
+    func testLocalSwitcherRefusesDirectSwitchAndRollbackAndPreservesRecoveryFiles() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileSystem = StartupFaultFileSystem(rootURL: root)
+        let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem, inMemory: true)
+        let context = ModelContext(container)
+        let current = NoteRecord(title: "Current")
+        context.insert(current)
+        try context.save()
+        let safetyURL = root.appendingPathComponent("Backups/safety/safety-existing", isDirectory: true)
+        let stagingURL = root.appendingPathComponent(".restore-staging/restore-existing", isDirectory: true)
+        let safetyFile = safetyURL.appendingPathComponent("safety-complete.json")
+        let stagedFile = stagingURL.appendingPathComponent("metadata.store")
+        try fileSystem.writeAndFlush(Data([1, 2, 3]), to: safetyFile)
+        try fileSystem.writeAndFlush(Data([4, 5, 6]), to: stagedFile)
+        let marker = RestoreMarker(recoveryRequired: true, safetyBackupPath: "Backups/safety/safety-existing", lastFailureState: "atomicSwitch")
+        try LocalRestoreMarkerStore(fileSystem: fileSystem).write(marker, fallbackDirectory: nil)
+        let before = try StartupFileSnapshot(root: root)
+        let switcher = LocalBackupModelStoreSwitcher(fileSystem: fileSystem)
+        let coordinator = BackupRestoreCoordinator(modelContext: context, fileSystem: fileSystem, modelStoreSwitcher: switcher)
+        fileSystem.mutations.removeAll()
+
+        XCTAssertEqual(coordinator.restore(from: try makeSimpleBackupData(title: "Imported")).state, .restoreFailed)
+        XCTAssertThrowsError(try switcher.writeStagingStore(metadata: BackupMetadata(noteRecords: [current]), drawings: [], at: stagingURL)) { error in
+            XCTAssertEqual(error as? BackupRestoreError, .restoreUnavailable)
+        }
+        XCTAssertThrowsError(try switcher.atomicSwitch(to: stagingURL)) { error in
+            XCTAssertEqual(error as? BackupRestoreError, .restoreUnavailable)
+        }
+        XCTAssertThrowsError(try switcher.rollback(from: safetyURL)) { error in
+            XCTAssertEqual(error as? BackupRestoreError, .restoreUnavailable)
+        }
+        XCTAssertTrue(fileSystem.mutations.isEmpty)
+        XCTAssertEqual(try StartupFileSnapshot(root: root), before)
+        XCTAssertEqual(try LocalRestoreMarkerStore(fileSystem: fileSystem).read(), marker)
+        XCTAssertEqual(try context.fetch(FetchDescriptor<NoteRecord>()).map(\.title), ["Current"])
+    }
+
     func testRestoreCapacityFailureLeavesCurrentDataAndDoesNotSwitch() throws {
         let root = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -605,6 +816,49 @@ final class CornellNoteTests: XCTestCase {
         XCTAssertTrue(switcher.didRollback)
         XCTAssertEqual(markerStore.marker?.recoveryRequired, false)
         XCTAssertEqual(try context.fetch(FetchDescriptor<NoteRecord>()).first?.title, "Current")
+    }
+
+    func testRollbackRetainedOldContextAndReopenedStore() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileSystem = LocalNoteFileSystem(rootURL: root)
+        let startup = NoteStartupController(fileSystem: fileSystem)
+        startup.recheck()
+        guard case .ready(let generation) = startup.state else {
+            return XCTFail("Initial disk store did not open")
+        }
+        let oldContext = generation.container.mainContext
+        let note = NoteRecord(title: "Current")
+        oldContext.insert(note)
+        try oldContext.save()
+        let persistence = NotePersistenceController(modelContext: oldContext, fileSystem: fileSystem,
+            canWrite: { generation.writeAdmission.isAllowed })
+        let coordinator = BackupRestoreCoordinator(
+            modelContext: oldContext,
+            fileSystem: fileSystem,
+            faultPlan: RestoreFaultPlan(failPostSwitchReopen: true),
+            startup: startup
+        )
+
+        let result = coordinator.restore(from: try makeSimpleBackupData(title: "Imported"))
+        XCTAssertEqual(result.state, .restoreFailed, result.errorDescription ?? "")
+        XCTAssertEqual(result.phase, .atomicSwitch)
+        XCTAssertEqual(try LocalRestoreMarkerStore(fileSystem: fileSystem).read()?.recoveryRequired, false)
+        XCTAssertFalse(generation.writeAdmission.isAllowed)
+        XCTAssertThrowsError(try persistence.saveTitle(note: note, title: "Late teardown write"))
+        guard case .ready(let retainedGeneration) = startup.state else {
+            return XCTFail("Rollback did not reopen the previous store")
+        }
+        XCTAssertFalse(retainedGeneration.container === generation.container)
+        XCTAssertTrue(retainedGeneration.writeAdmission.isAllowed)
+        XCTAssertFalse(oldContext.autosaveEnabled)
+        let current = try XCTUnwrap(try retainedGeneration.container.mainContext.fetch(FetchDescriptor<NoteRecord>()).first)
+        XCTAssertEqual(current.title, "Current")
+        try NotePersistenceController(modelContext: retainedGeneration.container.mainContext,
+            fileSystem: retainedGeneration.fileSystem,
+            canWrite: { retainedGeneration.writeAdmission.isAllowed }).saveTitle(note: current, title: "After rollback")
+        let reopened = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
+        XCTAssertEqual(try reopened.mainContext.fetch(FetchDescriptor<NoteRecord>()).map(\.title), ["After rollback"])
     }
 
     func testRollbackFailureWithMarkerWriteFailureRetainsSafetyBackup() throws {
@@ -796,8 +1050,11 @@ final class CornellNoteTests: XCTestCase {
         let root = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let fileSystem = LocalNoteFileSystem(rootURL: root)
-        let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
-        let context = ModelContext(container)
+        let startup = NoteStartupController(fileSystem: fileSystem)
+        startup.recheck()
+        guard case .ready(let original) = startup.state else { return XCTFail("Legacy store did not open") }
+        let context = ModelContext(original.container)
+        context.autosaveEnabled = false
         let note = NoteRecord(title: "Old")
         note.id = try XCTUnwrap(UUID(uuidString: "44444444-4444-4444-4444-444444444444"))
         context.insert(note)
@@ -808,17 +1065,308 @@ final class CornellNoteTests: XCTestCase {
         let oldData = try Data(contentsOf: oldURL)
         let fixture = try makeValidDrawingBackupData(title: "Restored")
 
-        let result = BackupRestoreCoordinator(modelContext: context, fileSystem: fileSystem).restore(from: fixture.data)
+        let result = BackupRestoreCoordinator(modelContext: context, fileSystem: fileSystem, startup: startup).restore(from: fixture.data)
         XCTAssertEqual(result.state, .completed, result.errorDescription ?? "")
         XCTAssertTrue(result.thumbnailRegenerated)
-        let reopened = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
-        let restoredContext = ModelContext(reopened)
+        XCTAssertFalse(original.writeAdmission.isAllowed)
+        guard case .ready(let selected) = startup.state else { return XCTFail("Restored generation did not open") }
+        XCTAssertNotEqual(selected.fileSystem.rootURL, root)
+        XCTAssertEqual(try Data(contentsOf: oldURL), oldData)
+        let restoredContext = ModelContext(selected.container)
         let restored = try XCTUnwrap(try restoredContext.fetch(FetchDescriptor<NoteRecord>()).first)
-        let restoredController = NotePersistenceController(modelContext: restoredContext, fileSystem: fileSystem)
+        var renderCount = 0
+        let restoredController = NotePersistenceController(modelContext: restoredContext, fileSystem: selected.fileSystem, renderThumbnail: {
+            renderCount += 1
+            return $0.image(from: CGRect(x: 0, y: 0, width: 1200, height: 900), scale: 1)
+        })
         let data = try XCTUnwrap(restoredController.thumbnailData(for: restored))
+        XCTAssertNotNil(restoredController.thumbnailImage(for: restored))
+        XCTAssertEqual(renderCount, 0)
         XCTAssertNotNil(UIImage(data: data))
         XCTAssertNotEqual(data, oldData)
         XCTAssertEqual(restored.drawingFileName, fixture.drawingPath)
+        let metadata = BackupMetadata(noteRecords: [restored])
+        let drawing = try restoredController.loadDrawing(for: restored).dataRepresentation()
+        let cacheURL = NotePersistenceController.thumbnailURL(root: selected.fileSystem.rootURL, id: restored.id,
+            schemaVersion: restored.drawingSchemaVersion, fileName: restored.drawingFileName, checksum: restored.drawingChecksum)
+        try selected.fileSystem.writeAndFlush(Data([0xff]), to: cacheURL)
+        XCTAssertNotNil(restoredController.thumbnailImage(for: restored))
+        XCTAssertEqual(renderCount, 1)
+        XCTAssertEqual(BackupMetadata(noteRecords: [restored]), metadata)
+        XCTAssertEqual(try restoredController.loadDrawing(for: restored).dataRepresentation(), drawing)
+        startup.recheck()
+        guard case .ready(let relaunched) = startup.state else { return XCTFail("Selection did not survive reopen") }
+        XCTAssertEqual(relaunched.fileSystem.rootURL, selected.fileSystem.rootURL)
+        let firstGenerationCache = try Data(contentsOf: cacheURL)
+        let second = BackupRestoreCoordinator(modelContext: relaunched.container.mainContext,
+            fileSystem: relaunched.fileSystem, startup: startup)
+            .restore(from: try makeSimpleBackupData(title: "Second restore"))
+        XCTAssertEqual(second.state, .completed, second.errorDescription ?? "")
+        guard case .ready(let secondGeneration) = startup.state else { return XCTFail("Second restore did not open") }
+        XCTAssertNotEqual(secondGeneration.fileSystem.rootURL, selected.fileSystem.rootURL)
+        XCTAssertEqual(try secondGeneration.container.mainContext.fetch(FetchDescriptor<NoteRecord>()).map(\.title), ["Second restore"])
+        XCTAssertEqual(try Data(contentsOf: cacheURL), firstGenerationCache)
+        XCTAssertEqual(try Data(contentsOf: oldURL), oldData)
+        XCTAssertFalse(fileSystem.fileExists(at: selected.fileSystem.rootURL.appendingPathComponent("Backups")))
+        XCTAssertNotNil(try LocalRestoreMarkerStore(fileSystem: fileSystem).read())
+    }
+
+    func testGenerationRestoreFailuresKeepPreviousStoreAndRevokeOldWriters() throws {
+        var staging = RestoreFaultPlan()
+        staging.failStagingWrite = true
+        var readBack = RestoreFaultPlan()
+        readBack.failStagingReadBack = true
+        var reopen = RestoreFaultPlan()
+        reopen.failSwiftDataReopen = true
+        var switchFailure = RestoreFaultPlan()
+        switchFailure.failAtomicSwitch = true
+        var postSwitch = RestoreFaultPlan()
+        postSwitch.failPostSwitchReopen = true
+        var rollback = postSwitch
+        rollback.failRollback = true
+        var marker = RestoreFaultPlan()
+        marker.failMarkerWrite = true
+        for (fault, recovery) in [(staging, false), (readBack, false), (reopen, false),
+                                  (switchFailure, false), (postSwitch, false), (rollback, true), (marker, true)] {
+            let root = try makeTemporaryDirectory()
+            let fileSystem = LocalNoteFileSystem(rootURL: root)
+            let startup = NoteStartupController(fileSystem: fileSystem)
+            startup.recheck()
+            guard case .ready(let original) = startup.state else { return XCTFail("Store did not open") }
+            let context = original.container.mainContext
+            let note = NoteRecord(title: "Original")
+            context.insert(note)
+            try context.save()
+            let persistence = NotePersistenceController(modelContext: context, fileSystem: fileSystem,
+                canWrite: { original.writeAdmission.isAllowed })
+            try persistence.save(note: note, drawing: nonemptyDrawing(offset: 30))
+            let drawing = try persistence.loadDrawing(for: note).dataRepresentation()
+            let result = BackupRestoreCoordinator(modelContext: context, fileSystem: fileSystem,
+                faultPlan: fault, startup: startup).restore(from: try makeSimpleBackupData(title: "Imported"))
+            XCTAssertEqual(result.state, recovery ? .recoveryRequired : .restoreFailed, result.errorDescription ?? "")
+            XCTAssertFalse(original.writeAdmission.isAllowed)
+            XCTAssertThrowsError(try persistence.saveTitle(note: note, title: "Late write"))
+            XCTAssertEqual(note.title, "Original")
+            XCTAssertEqual(try persistence.loadDrawing(for: note).dataRepresentation(), drawing)
+            if recovery {
+                guard case .blocked = startup.state else { return XCTFail("Uncertain restore was admitted") }
+            } else {
+                guard case .ready(let current) = startup.state else { return XCTFail("Rollback did not reopen") }
+                XCTAssertEqual(current.fileSystem.rootURL, root)
+                XCTAssertTrue(current.writeAdmission.isAllowed)
+                XCTAssertEqual(try current.container.mainContext.fetch(FetchDescriptor<NoteRecord>()).map(\.title), ["Original"])
+            }
+        }
+    }
+
+    func testSelectedGenerationMissingOrCorruptNeverCreatesAnEmptyStore() throws {
+        for corruption in ["missing-record", "corrupt-record", "missing-store", "unknown-schema"] {
+            let root = try makeTemporaryDirectory()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let fileSystem = LocalNoteFileSystem(rootURL: root)
+            let selection = NoteStoreSelectionStore(fileSystem: fileSystem)
+            let id = UUID().uuidString.lowercased()
+            try selection.write(NoteStoreSelection(schema: 1, store: id))
+            let record = root.appendingPathComponent("active-store.json")
+            if corruption == "missing-record" { try fileSystem.removeItem(at: record) }
+            if corruption == "corrupt-record" { try fileSystem.writeAndFlush(Data([0xff]), to: record) }
+            if corruption == "unknown-schema" {
+                try fileSystem.writeAndFlush(Data("{\"schema\":2,\"store\":\"legacy\"}".utf8), to: record)
+            }
+            let startup = NoteStartupController(fileSystem: fileSystem)
+            startup.recheck()
+            guard case .blocked = startup.state else { return XCTFail("Invalid selection was admitted: \(corruption)") }
+            XCTAssertFalse(fileSystem.fileExists(at: root.appendingPathComponent("metadata.store")))
+            XCTAssertFalse(fileSystem.fileExists(at: root.appendingPathComponent("generations/\(id)/metadata.store")))
+        }
+    }
+
+    func testSelectionReadFailuresAndOutsideGenerationFailClosed() throws {
+        let root = try makeTemporaryDirectory()
+        let outside = try makeTemporaryDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: outside)
+        }
+        let fileSystem = StartupFaultFileSystem(rootURL: root)
+        let record = root.appendingPathComponent("active-store.json")
+        fileSystem.readFailures.insert(record)
+        fileSystem.hiddenPaths.insert(record)
+        let startup = NoteStartupController(fileSystem: fileSystem)
+        startup.recheck()
+        guard case .blocked = startup.state else { return XCTFail("Unreadable selection fell back to legacy") }
+        fileSystem.readFailures.removeAll()
+        fileSystem.hiddenPaths.removeAll()
+        let selection = NoteStoreSelectionStore(fileSystem: fileSystem)
+        let id = UUID().uuidString.lowercased()
+        try selection.write(NoteStoreSelection(schema: 1, store: id))
+        try fileSystem.createDirectory(at: root.appendingPathComponent("generations"))
+        try FileManager.default.createSymbolicLink(at: root.appendingPathComponent("generations/\(id)"), withDestinationURL: outside)
+        startup.recheck()
+        guard case .blocked = startup.state else { return XCTFail("Outside generation was admitted") }
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: outside.path).isEmpty)
+    }
+
+    func testInterruptedSelectionSwitchRequiresRecoveryWithoutMovingStores() throws {
+        for afterReplace in [false, true] {
+            let root = try makeTemporaryDirectory()
+            let fileSystem = SelectionCrashFileSystem(rootURL: root, afterReplace: afterReplace)
+            let startup = NoteStartupController(fileSystem: fileSystem)
+            startup.recheck()
+            guard case .ready(let original) = startup.state else { return XCTFail("Store did not open") }
+            let context = original.container.mainContext
+            context.insert(NoteRecord(title: "Original"))
+            try context.save()
+            let result = BackupRestoreCoordinator(modelContext: context, fileSystem: fileSystem, startup: startup)
+                .restore(from: try makeSimpleBackupData(title: "Imported"))
+            XCTAssertEqual(result.state, .recoveryRequired)
+            XCTAssertTrue(fileSystem.crashed)
+            XCTAssertFalse(original.writeAdmission.isAllowed)
+            XCTAssertTrue(fileSystem.fileExists(at: root.appendingPathComponent("metadata.store")))
+            XCTAssertEqual(try context.fetch(FetchDescriptor<NoteRecord>()).map(\.title), ["Original"])
+            let relaunched = NoteStartupController(fileSystem: LocalNoteFileSystem(rootURL: root))
+            relaunched.recheck()
+            guard case .blocked(.recoveryRequired) = relaunched.state else { return XCTFail("Interrupted switch was admitted") }
+            XCTAssertTrue(try LocalRestoreMarkerStore(fileSystem: fileSystem).read()?.recoveryRequired == true)
+        }
+    }
+
+    func testBothMarkerWritesFailButPendingIntentAndStartupRemainBlocked() throws {
+        let root = try makeTemporaryDirectory()
+        let fileSystem = RejectMarkerReplacementFileSystem(rootURL: root)
+        let startup = NoteStartupController(fileSystem: fileSystem)
+        startup.recheck()
+        guard case .ready(let original) = startup.state else { return XCTFail("Store did not open") }
+        let context = original.container.mainContext
+        context.insert(NoteRecord(title: "Original"))
+        try context.save()
+        let result = BackupRestoreCoordinator(modelContext: context, fileSystem: fileSystem, startup: startup)
+            .restore(from: try makeSimpleBackupData(title: "Imported"))
+        XCTAssertEqual(result.state, .recoveryRequired)
+        XCTAssertGreaterThanOrEqual(fileSystem.rejectedWrites, 2)
+        XCTAssertFalse(original.writeAdmission.isAllowed)
+        for _ in 0..<2 {
+            startup.recheck()
+            guard case .blocked(.recoveryRequired) = startup.state else { return XCTFail("Marker failure was forgotten") }
+        }
+        let relaunched = NoteStartupController(fileSystem: LocalNoteFileSystem(rootURL: root))
+        relaunched.recheck()
+        guard case .blocked(.recoveryRequired) = relaunched.state else { return XCTFail("Pending intent was lost on restart") }
+        XCTAssertEqual(try context.fetch(FetchDescriptor<NoteRecord>()).map(\.title), ["Original"])
+    }
+
+    func testResolvedMarkerReadFailureRetainsPendingIntentWhenRecoveryWritesFail() throws {
+        let root = try makeTemporaryDirectory()
+        let fileSystem = ResolutionFailureFileSystem(rootURL: root, failBeforeFallbackRemoval: true)
+        let startup = NoteStartupController(fileSystem: fileSystem)
+        startup.recheck()
+        guard case .ready(let original) = startup.state else { return XCTFail("Store did not open") }
+        let result = BackupRestoreCoordinator(modelContext: original.container.mainContext,
+            fileSystem: fileSystem, startup: startup).restore(from: try makeSimpleBackupData(title: "Imported"))
+        XCTAssertEqual(result.state, .recoveryRequired)
+        XCTAssertEqual(fileSystem.failedReads, 1)
+        XCTAssertGreaterThanOrEqual(fileSystem.rejectedWrites, 2)
+        XCTAssertFalse(original.writeAdmission.isAllowed)
+        startup.recheck()
+        guard case .blocked(.recoveryRequired) = startup.state else { return XCTFail("Recovery was not latched") }
+        let relaunched = NoteStartupController(fileSystem: LocalNoteFileSystem(rootURL: root))
+        relaunched.recheck()
+        guard case .blocked(.recoveryRequired) = relaunched.state else { return XCTFail("Resolution uncertainty was lost on restart") }
+    }
+
+    func testResolvedMarkerPublicationHasNoFallibleReadAfterFallbackRemoval() throws {
+        let root = try makeTemporaryDirectory()
+        let fileSystem = ResolutionFailureFileSystem(rootURL: root, failBeforeFallbackRemoval: false)
+        let startup = NoteStartupController(fileSystem: fileSystem)
+        startup.recheck()
+        guard case .ready(let original) = startup.state else { return XCTFail("Store did not open") }
+        let result = BackupRestoreCoordinator(modelContext: original.container.mainContext,
+            fileSystem: fileSystem, startup: startup).restore(from: try makeSimpleBackupData(title: "Imported"))
+        XCTAssertEqual(result.state, .completed)
+        XCTAssertTrue(fileSystem.removedFallback)
+        XCTAssertEqual(fileSystem.failedReads, 0)
+        guard case .ready(let selected) = startup.state else { return XCTFail("Prepared container was not published") }
+        XCTAssertEqual(try selected.container.mainContext.fetch(FetchDescriptor<NoteRecord>()).map(\.title), ["Imported"])
+        let relaunched = NoteStartupController(fileSystem: LocalNoteFileSystem(rootURL: root))
+        relaunched.recheck()
+        guard case .ready = relaunched.state else { return XCTFail("Committed restore did not survive restart") }
+    }
+
+    func testPublishedContainerIsPreparedBeforeMarkerResolutionAndReused() throws {
+        let root = try makeTemporaryDirectory()
+        let fileSystem = LocalNoteFileSystem(rootURL: root)
+        var openedRoots: [URL] = []
+        var failedNewStore = false
+        let startup = NoteStartupController(fileSystem: fileSystem, openSelectedContainer: { selected in
+            openedRoots.append(selected.rootURL)
+            if selected.rootURL != root, !failedNewStore {
+                failedNewStore = true
+                throw BackupRestoreError.storeReopenFailed
+            }
+            return try NotePersistenceController.makeContainer(fileSystem: selected)
+        })
+        startup.recheck()
+        guard case .ready(let original) = startup.state else { return XCTFail("Store did not open") }
+        let context = original.container.mainContext
+        context.insert(NoteRecord(title: "Original"))
+        try context.save()
+        let data = try makeSimpleBackupData(title: "Imported")
+        let result = BackupRestoreCoordinator(modelContext: context, fileSystem: fileSystem, startup: startup).restore(from: data)
+        XCTAssertEqual(result.state, .restoreFailed)
+        XCTAssertTrue(failedNewStore)
+        XCTAssertEqual(openedRoots.count, 3, "Initial open, failed published open, then rollback open")
+        guard case .ready(let previous) = startup.state else { return XCTFail("Rollback did not publish its prepared container") }
+        XCTAssertEqual(previous.fileSystem.rootURL, root)
+        XCTAssertEqual(try previous.container.mainContext.fetch(FetchDescriptor<NoteRecord>()).map(\.title), ["Original"])
+        XCTAssertEqual(try LocalRestoreMarkerStore(fileSystem: fileSystem).read()?.recoveryRequired, false)
+        let retry = BackupRestoreCoordinator(modelContext: previous.container.mainContext,
+            fileSystem: previous.fileSystem, startup: startup).restore(from: data)
+        XCTAssertEqual(retry.state, .completed, retry.errorDescription ?? "")
+        XCTAssertEqual(openedRoots.count, 4, "Successful publication must reuse the already-opened container")
+    }
+
+    func testCapacityIncludesLargeCurrentSafetyMetadataBeforeCreatingBackup() throws {
+        let root = try makeTemporaryDirectory()
+        let fileSystem = FaultInjectingFileSystem(rootURL: root)
+        let startup = NoteStartupController(fileSystem: fileSystem)
+        startup.recheck()
+        guard case .ready(let generation) = startup.state else { return XCTFail("Store did not open") }
+        let context = generation.container.mainContext
+        let title = String(repeating: "a", count: 2_000_000)
+        context.insert(NoteRecord(title: title))
+        try context.save()
+        let data = try makeSimpleBackupData(title: "Small import")
+        fileSystem.availableCapacity = Int64(data.count * 6) + Int64(BackupRestoreCoordinator.capacityReserve)
+        let result = BackupRestoreCoordinator(modelContext: context, fileSystem: fileSystem, startup: startup).restore(from: data)
+        XCTAssertEqual(result.state, .restoreFailed)
+        XCTAssertEqual(result.errorDescription, BackupRestoreError.capacityInsufficient.localizedDescription)
+        XCTAssertNil(result.safetyBackupURL)
+        XCTAssertFalse(fileSystem.fileExists(at: root.appendingPathComponent("Backups")))
+        XCTAssertEqual(try context.fetch(FetchDescriptor<NoteRecord>()).first?.title, title)
+    }
+
+    func testDrawingStrokeBlocksRestoreBeforeReadingProvider() throws {
+        let root = try makeTemporaryDirectory()
+        let fileSystem = LocalNoteFileSystem(rootURL: root)
+        let startup = NoteStartupController(fileSystem: fileSystem)
+        startup.recheck()
+        guard case .ready(let generation) = startup.state else { return XCTFail("Store did not open") }
+        let context = generation.container.mainContext
+        let note = NoteRecord(title: "Current")
+        context.insert(note)
+        try context.save()
+        let session = NoteEditingSession(note: note,
+            persistence: NotePersistenceController(modelContext: context, fileSystem: fileSystem))
+        generation.writeAdmission.register(session)
+        session.setDrawingStrokeInProgress(true)
+        let provider = RecordingDocumentProvider()
+        let result = try BackupRestoreCoordinator(modelContext: context, fileSystem: fileSystem, startup: startup)
+            .restore(from: root.appendingPathComponent("not-read"), provider: provider)
+        XCTAssertEqual(result.state, .restoreFailed)
+        XCTAssertFalse(provider.didReadImportedFile)
+        XCTAssertTrue(generation.writeAdmission.isAllowed)
+        session.setDrawingStrokeInProgress(false)
+        XCTAssertTrue(startup.canRestore)
     }
 
     func testLocalThumbnailRegenerationDropsOmittedCacheAndWritesActiveDrawing() throws {
@@ -1298,6 +1846,36 @@ final class CornellNoteTests: XCTestCase {
 
     // MARK: - Startup admission and generation revocation
 
+    func testStartupGenerationRetainsInjectedFileSystemAcrossRecheck() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let otherRoot = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: otherRoot) }
+        let fileSystem = LocalNoteFileSystem(rootURL: root)
+        let otherFileSystem = LocalNoteFileSystem(rootURL: otherRoot)
+        let startup = NoteStartupController(fileSystem: fileSystem)
+        startup.recheck()
+        guard case .ready(let generation) = startup.state else { return XCTFail("Store did not open") }
+        XCTAssertTrue(generation.fileSystem === fileSystem)
+        let context = ModelContext(generation.container)
+        let note = NoteRecord(title: "Isolated")
+        context.insert(note)
+        try context.save()
+        let persistence = NotePersistenceController(modelContext: context, fileSystem: generation.fileSystem)
+        try persistence.save(note: note, drawing: nonemptyDrawing(offset: 0))
+        XCTAssertNotNil(persistence.thumbnailImage(for: note))
+        XCTAssertNotNil(try persistence.thumbnailData(for: note))
+        XCTAssertTrue(fileSystem.fileExists(at: root.appendingPathComponent(try XCTUnwrap(note.drawingFileName))))
+        XCTAssertFalse(otherFileSystem.fileExists(at: otherRoot.appendingPathComponent(try XCTUnwrap(note.drawingFileName))))
+        _ = try BackupExportCoordinator(modelContext: context, fileSystem: generation.fileSystem).makeVerifiedEnvelope()
+        XCTAssertFalse(otherFileSystem.fileExists(at: otherRoot.appendingPathComponent(".backup-staging")))
+        startup.recheck()
+        guard case .ready(let reopened) = startup.state else { return XCTFail("Store did not reopen") }
+        XCTAssertTrue(reopened.fileSystem === fileSystem)
+        XCTAssertFalse(generation.writeAdmission.isAllowed)
+        XCTAssertEqual(try ModelContext(reopened.container).fetch(FetchDescriptor<NoteRecord>()).map(\.title), ["Isolated"])
+    }
+
     func testStartupNormalAdmissionReadsMarkerBeforeCreatingContainer() throws {
         for marker in [nil, RestoreMarker(recoveryRequired: false, safetyBackupPath: nil, lastFailureState: nil)] {
             let root = try makeTemporaryDirectory()
@@ -1306,7 +1884,7 @@ final class CornellNoteTests: XCTestCase {
             markerStore.marker = marker
             var events: [String] = []
             markerStore.onRead = { events.append("read") }
-            let startup = NoteStartupController(markerStore: markerStore) {
+            let startup = NoteStartupController(fileSystem: LocalNoteFileSystem(rootURL: root), markerStore: markerStore) {
                 events.append("open")
                 return try NotePersistenceController.makeContainer(fileSystem: LocalNoteFileSystem(rootURL: root), inMemory: true)
             }
@@ -1330,7 +1908,7 @@ final class CornellNoteTests: XCTestCase {
         let before = try StartupFileSnapshot(root: root)
         fileSystem.mutations.removeAll()
         var opens = 0
-        let startup = NoteStartupController(markerStore: LocalRestoreMarkerStore(fileSystem: fileSystem)) {
+        let startup = NoteStartupController(fileSystem: LocalNoteFileSystem(rootURL: root), markerStore: LocalRestoreMarkerStore(fileSystem: fileSystem)) {
             opens += 1
             throw BackupEnvelopeError.invalidMetadata
         }
@@ -1370,7 +1948,7 @@ final class CornellNoteTests: XCTestCase {
             XCTAssertTrue(survivor.recoveryRequired, "\(crashPoint)")
             XCTAssertEqual(survivor, crashPoint == .afterReplace ? rewrite : marker, "\(crashPoint)")
             var opens = 0
-            let startup = NoteStartupController(markerStore: LocalRestoreMarkerStore(fileSystem: restarted)) {
+            let startup = NoteStartupController(fileSystem: LocalNoteFileSystem(rootURL: root), markerStore: LocalRestoreMarkerStore(fileSystem: restarted)) {
                 opens += 1
                 throw BackupEnvelopeError.invalidMetadata
             }
@@ -1403,7 +1981,7 @@ final class CornellNoteTests: XCTestCase {
         XCTAssertEqual(try LocalRestoreMarkerStore(fileSystem: fixture).read(), resolved)
         XCTAssertFalse(try FileManager.default.contentsOfDirectory(atPath: root.path).contains { $0.hasSuffix(".tmp") })
         var opens = 0
-        let startup = NoteStartupController(markerStore: LocalRestoreMarkerStore(fileSystem: LocalNoteFileSystem(rootURL: root))) {
+        let startup = NoteStartupController(fileSystem: LocalNoteFileSystem(rootURL: root), markerStore: LocalRestoreMarkerStore(fileSystem: LocalNoteFileSystem(rootURL: root))) {
             opens += 1
             return try NotePersistenceController.makeContainer(fileSystem: LocalNoteFileSystem(rootURL: root), inMemory: true)
         }
@@ -1427,7 +2005,7 @@ final class CornellNoteTests: XCTestCase {
             fileSystem.mutations.removeAll()
             var opens = 0
             let markerStore = LocalRestoreMarkerStore(fileSystem: fileSystem)
-            let startup = NoteStartupController(markerStore: markerStore) {
+            let startup = NoteStartupController(fileSystem: LocalNoteFileSystem(rootURL: root), markerStore: markerStore) {
                 opens += 1
                 throw BackupEnvelopeError.invalidMetadata
             }
@@ -1459,7 +2037,7 @@ final class CornellNoteTests: XCTestCase {
                 fileSystem.mutations.removeAll()
                 var opens = 0
                 let markerStore = LocalRestoreMarkerStore(fileSystem: fileSystem)
-                let startup = NoteStartupController(markerStore: markerStore) {
+                let startup = NoteStartupController(fileSystem: LocalNoteFileSystem(rootURL: root), markerStore: markerStore) {
                     opens += 1
                     throw BackupEnvelopeError.invalidMetadata
                 }
@@ -1490,7 +2068,7 @@ final class CornellNoteTests: XCTestCase {
                 fileSystem.readFailures.insert(url)
                 if hidden { fileSystem.hiddenPaths.insert(url) }
                 var opens = 0
-                let startup = NoteStartupController(markerStore: LocalRestoreMarkerStore(fileSystem: fileSystem)) {
+                let startup = NoteStartupController(fileSystem: LocalNoteFileSystem(rootURL: root), markerStore: LocalRestoreMarkerStore(fileSystem: fileSystem)) {
                     opens += 1
                     throw BackupEnvelopeError.invalidMetadata
                 }
@@ -1521,7 +2099,7 @@ final class CornellNoteTests: XCTestCase {
                 fileSystem.directoryFailures.insert(safetyRoot)
                 if hidden { fileSystem.hiddenPaths.insert(safetyRoot) }
                 var opens = 0
-                let startup = NoteStartupController(markerStore: LocalRestoreMarkerStore(fileSystem: fileSystem)) {
+                let startup = NoteStartupController(fileSystem: LocalNoteFileSystem(rootURL: root), markerStore: LocalRestoreMarkerStore(fileSystem: fileSystem)) {
                     opens += 1
                     throw BackupEnvelopeError.invalidMetadata
                 }
@@ -1542,7 +2120,7 @@ final class CornellNoteTests: XCTestCase {
         let fileSystem = StartupFaultFileSystem(rootURL: root.appendingPathComponent("not-created"))
         let before = try StartupFileSnapshot(root: root)
         var opens = 0
-        let startup = NoteStartupController(markerStore: LocalRestoreMarkerStore(fileSystem: fileSystem)) {
+        let startup = NoteStartupController(fileSystem: LocalNoteFileSystem(rootURL: root), markerStore: LocalRestoreMarkerStore(fileSystem: fileSystem)) {
             opens += 1
             XCTAssertEqual(try StartupFileSnapshot(root: root), before, "Admission must not create the root")
             return try NotePersistenceController.makeContainer(fileSystem: fileSystem, inMemory: true)
@@ -1567,7 +2145,7 @@ final class CornellNoteTests: XCTestCase {
         let before = try StartupFileSnapshot(root: root)
         fileSystem.mutations.removeAll()
         var opens = 0
-        let startup = NoteStartupController(markerStore: LocalRestoreMarkerStore(fileSystem: fileSystem)) {
+        let startup = NoteStartupController(fileSystem: LocalNoteFileSystem(rootURL: root), markerStore: LocalRestoreMarkerStore(fileSystem: fileSystem)) {
             opens += 1
             return try NotePersistenceController.makeContainer(fileSystem: fileSystem, inMemory: true)
         }
@@ -1590,7 +2168,7 @@ final class CornellNoteTests: XCTestCase {
         var events: [String] = []
         markerStore.onRead = { events.append("read") }
         var opens = 0
-        let startup = NoteStartupController(markerStore: markerStore) {
+        let startup = NoteStartupController(fileSystem: LocalNoteFileSystem(rootURL: root), markerStore: markerStore) {
             events.append("open")
             opens += 1
             if opens < 3 { throw BackupEnvelopeError.invalidMetadata }
@@ -1611,9 +2189,11 @@ final class CornellNoteTests: XCTestCase {
     }
 
     func testStartupRetryCannotBypassNewRecoveryOrUnreadableMarker() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
         let markerStore = StartupRecordingMarkerStore()
         var opens = 0
-        let startup = NoteStartupController(markerStore: markerStore) {
+        let startup = NoteStartupController(fileSystem: LocalNoteFileSystem(rootURL: root), markerStore: markerStore) {
             opens += 1
             throw BackupEnvelopeError.invalidMetadata
         }
@@ -1641,7 +2221,7 @@ final class CornellNoteTests: XCTestCase {
             fileSystem.mutations.removeAll()
             let markerStore = StartupRecordingMarkerStore()
             var opens = 0
-            let startup = NoteStartupController(markerStore: markerStore) {
+            let startup = NoteStartupController(fileSystem: LocalNoteFileSystem(rootURL: root), markerStore: markerStore) {
                 opens += 1
                 if opens > 1 { throw BackupEnvelopeError.invalidMetadata }
                 return try NotePersistenceController.makeContainer(fileSystem: fileSystem, inMemory: true)
@@ -1681,7 +2261,7 @@ final class CornellNoteTests: XCTestCase {
         let corruptSnapshot = try StartupFileSnapshot(root: root)
         fileSystem.mutations.removeAll()
         var opens = 0
-        let startup = NoteStartupController(markerStore: LocalRestoreMarkerStore(fileSystem: fileSystem)) {
+        let startup = NoteStartupController(fileSystem: LocalNoteFileSystem(rootURL: root), markerStore: LocalRestoreMarkerStore(fileSystem: fileSystem)) {
             opens += 1
             return try NotePersistenceController.makeContainer(fileSystem: fileSystem, inMemory: true)
         }
@@ -1709,7 +2289,7 @@ final class CornellNoteTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let fileSystem = LocalNoteFileSystem(rootURL: root)
         let markerStore = StartupRecordingMarkerStore()
-        let startup = NoteStartupController(markerStore: markerStore) {
+        let startup = NoteStartupController(fileSystem: LocalNoteFileSystem(rootURL: root), markerStore: markerStore) {
             try NotePersistenceController.makeContainer(fileSystem: fileSystem, inMemory: true)
         }
         startup.recheck()
@@ -1740,7 +2320,7 @@ final class CornellNoteTests: XCTestCase {
             let before = try StartupFileSnapshot(root: root)
             fileSystem.mutations.removeAll()
             var opens = 0
-            let startup = NoteStartupController(markerStore: LocalRestoreMarkerStore(fileSystem: fileSystem)) {
+            let startup = NoteStartupController(fileSystem: LocalNoteFileSystem(rootURL: root), markerStore: LocalRestoreMarkerStore(fileSystem: fileSystem)) {
                 opens += 1
                 throw BackupEnvelopeError.invalidMetadata
             }
@@ -1759,7 +2339,7 @@ final class CornellNoteTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let markerStore = StartupRecordingMarkerStore()
         var oldAdmission: NoteWriteAdmission?
-        let startup = NoteStartupController(markerStore: markerStore) {
+        let startup = NoteStartupController(fileSystem: LocalNoteFileSystem(rootURL: root), markerStore: markerStore) {
             if let oldAdmission { XCTAssertFalse(oldAdmission.isAllowed) }
             return try NotePersistenceController.makeContainer(fileSystem: LocalNoteFileSystem(rootURL: root), inMemory: true)
         }
@@ -1798,7 +2378,7 @@ final class CornellNoteTests: XCTestCase {
                 try fileSystem.writeAndFlush(try JSONEncoder().encode(resolved), to: markerURL)
                 var opens = 0
                 var failOpen = false
-                let startup = NoteStartupController(markerStore: LocalRestoreMarkerStore(fileSystem: fileSystem)) {
+                let startup = NoteStartupController(fileSystem: LocalNoteFileSystem(rootURL: root), markerStore: LocalRestoreMarkerStore(fileSystem: fileSystem)) {
                     opens += 1
                     if failOpen { throw BackupEnvelopeError.invalidMetadata }
                     // Only the first generation uses the old disk store; retry is an isolated factory result.
@@ -2097,6 +2677,81 @@ private struct StartupFileSnapshot: Equatable {
     }
 }
 
+private final class ResolutionFailureFileSystem: LocalNoteFileSystem {
+    let failBeforeFallbackRemoval: Bool
+    private var replacedResolvedMarker = false
+    private(set) var removedFallback = false
+    private(set) var failedReads = 0
+    private(set) var rejectedWrites = 0
+
+    init(rootURL: URL, failBeforeFallbackRemoval: Bool) {
+        self.failBeforeFallbackRemoval = failBeforeFallbackRemoval
+        super.init(rootURL: rootURL)
+    }
+
+    override func replaceItem(at destinationURL: URL, withItemAt sourceURL: URL) throws {
+        if failedReads > 0, ["restore-state.json", "recovery-state.json"].contains(destinationURL.lastPathComponent) {
+            rejectedWrites += 1
+            throw POSIXError(.ENOSPC)
+        }
+        let isResolved = destinationURL.lastPathComponent == "restore-state.json" &&
+            (try? JSONDecoder().decode(RestoreMarker.self, from: super.readData(at: sourceURL)))?.recoveryRequired == false
+        try super.replaceItem(at: destinationURL, withItemAt: sourceURL)
+        if isResolved { replacedResolvedMarker = true }
+    }
+
+    override func readData(at url: URL) throws -> Data {
+        if url.lastPathComponent == "restore-state.json", replacedResolvedMarker,
+           (failBeforeFallbackRemoval || removedFallback), failedReads == 0 {
+            failedReads += 1
+            throw POSIXError(.EIO)
+        }
+        return try super.readData(at: url)
+    }
+
+    override func removeItem(at url: URL) throws {
+        try super.removeItem(at: url)
+        if url.lastPathComponent == "recovery-state.json" { removedFallback = true }
+    }
+}
+
+private final class RejectMarkerReplacementFileSystem: LocalNoteFileSystem {
+    private(set) var rejectedWrites = 0
+
+    override func replaceItem(at destinationURL: URL, withItemAt sourceURL: URL) throws {
+        if ["restore-state.json", "recovery-state.json"].contains(destinationURL.lastPathComponent) {
+            rejectedWrites += 1
+            throw POSIXError(.ENOSPC)
+        }
+        try super.replaceItem(at: destinationURL, withItemAt: sourceURL)
+    }
+}
+
+private final class SelectionCrashFileSystem: LocalNoteFileSystem {
+    let afterReplace: Bool
+    private(set) var crashed = false
+
+    init(rootURL: URL, afterReplace: Bool) {
+        self.afterReplace = afterReplace
+        super.init(rootURL: rootURL)
+    }
+
+    override func writeAndFlush(_ data: Data, to url: URL) throws {
+        guard !crashed else { throw POSIXError(.EINTR) }
+        try super.writeAndFlush(data, to: url)
+    }
+
+    override func replaceItem(at destinationURL: URL, withItemAt sourceURL: URL) throws {
+        guard !crashed else { throw POSIXError(.EINTR) }
+        if destinationURL.lastPathComponent == "active-store.json" {
+            if afterReplace { try super.replaceItem(at: destinationURL, withItemAt: sourceURL) }
+            crashed = true
+            throw POSIXError(.EINTR)
+        }
+        try super.replaceItem(at: destinationURL, withItemAt: sourceURL)
+    }
+}
+
 private final class StartupFaultFileSystem: LocalNoteFileSystem {
     var readFailures: Set<URL> = []
     var directoryFailures: Set<URL> = []
@@ -2347,6 +3002,9 @@ private final class RecordingModelStoreSwitcher: BackupModelStoreSwitcher {
     var failRollback = false
     private var reopenCount = 0
 
+    // This double only exercises coordinator control flow; it does not prove a real switch is safe.
+    func requireSafeRestoreAdmission() throws {}
+
     func writeStagingStore(metadata: BackupMetadata, drawings: [BackupDrawingRecord], at stagingURL: URL) throws {}
 
     func reopenStore(at rootURL: URL, expectedMetadata: BackupMetadata) throws {}
@@ -2400,6 +3058,7 @@ private struct FixedBackupUUIDSource: BackupUUIDSource {
 
 private final class RecordingDocumentProvider: DocumentProviderAdapter {
     var didExport = false
+    var didReadImportedFile = false
     var failExport = false
     var failure: BackupProviderError?
 
@@ -2420,7 +3079,8 @@ private final class RecordingDocumentProvider: DocumentProviderAdapter {
     }
 
     func readImportedFile(at url: URL) throws -> Data {
-        try Data(contentsOf: url)
+        didReadImportedFile = true
+        return try Data(contentsOf: url)
     }
 }
 
