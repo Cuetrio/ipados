@@ -792,6 +792,35 @@ final class CornellNoteTests: XCTestCase {
         XCTAssertFalse(thumbnail.didRegenerate)
     }
 
+    func testRestorePipelineWritesReadableThumbnailForReusedID() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileSystem = LocalNoteFileSystem(rootURL: root)
+        let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
+        let context = ModelContext(container)
+        let note = NoteRecord(title: "Old")
+        note.id = try XCTUnwrap(UUID(uuidString: "44444444-4444-4444-4444-444444444444"))
+        context.insert(note)
+        try context.save()
+        let controller = NotePersistenceController(modelContext: context, fileSystem: fileSystem)
+        try controller.save(note: note, drawing: nonemptyDrawing(offset: 200))
+        let oldURL = try controller.regenerateThumbnail(for: note, drawing: controller.loadDrawing(for: note))
+        let oldData = try Data(contentsOf: oldURL)
+        let fixture = try makeValidDrawingBackupData(title: "Restored")
+
+        let result = BackupRestoreCoordinator(modelContext: context, fileSystem: fileSystem).restore(from: fixture.data)
+        XCTAssertEqual(result.state, .completed, result.errorDescription ?? "")
+        XCTAssertTrue(result.thumbnailRegenerated)
+        let reopened = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
+        let restoredContext = ModelContext(reopened)
+        let restored = try XCTUnwrap(try restoredContext.fetch(FetchDescriptor<NoteRecord>()).first)
+        let restoredController = NotePersistenceController(modelContext: restoredContext, fileSystem: fileSystem)
+        let data = try XCTUnwrap(restoredController.thumbnailData(for: restored))
+        XCTAssertNotNil(UIImage(data: data))
+        XCTAssertNotEqual(data, oldData)
+        XCTAssertEqual(restored.drawingFileName, fixture.drawingPath)
+    }
+
     func testLocalThumbnailRegenerationDropsOmittedCacheAndWritesActiveDrawing() throws {
         let root = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -821,7 +850,10 @@ final class CornellNoteTests: XCTestCase {
         )
 
         XCTAssertFalse(fileSystem.fileExists(at: staleURL))
-        XCTAssertTrue(fileSystem.fileExists(at: root.appendingPathComponent("thumbnails/\(id.uuidString).png")))
+        let note = metadata.notes[0].makeNote()
+        let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem, inMemory: true)
+        let controller = NotePersistenceController(modelContext: ModelContext(container), fileSystem: fileSystem)
+        XCTAssertNotNil(UIImage(data: try XCTUnwrap(controller.thumbnailData(for: note))))
     }
 
     func testMarkerWriteFailureRetainsSafetyBackupAndRequiresRecovery() throws {

@@ -97,7 +97,11 @@ final class LocalBackupThumbnailRegenerator: BackupThumbnailRegenerator {
             let drawing = try PKDrawing(data: payload)
             let image = drawing.image(from: CGRect(x: 0, y: 0, width: 1200, height: 900), scale: 1)
             guard let data = image.pngData() else { throw BackupEnvelopeError.invalidMetadata }
-            let url = directory.appendingPathComponent("\(note.id.uuidString).png")
+            let url = NotePersistenceController.thumbnailURL(
+                root: fileSystem.rootURL, id: note.id, schemaVersion: note.drawingSchemaVersion,
+                fileName: note.drawingFileName, checksum: note.drawingChecksum
+            )
+            try fileSystem.createDirectory(at: url.deletingLastPathComponent())
             try fileSystem.writeAndFlush(data, to: url)
         }
     }

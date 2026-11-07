@@ -254,8 +254,18 @@ final class NotePersistenceController {
 
     // The cache key follows committed metadata, never the editor's in-memory draft.
     static func thumbnailKey(for note: NoteRecord) -> String {
-        let identity = "\(note.drawingSchemaVersion):\(note.drawingFileName ?? ""):\(note.drawingChecksum ?? "")"
+        thumbnailKey(schemaVersion: note.drawingSchemaVersion, fileName: note.drawingFileName, checksum: note.drawingChecksum)
+    }
+
+    static func thumbnailKey(schemaVersion: Int, fileName: String?, checksum: String?) -> String {
+        let identity = "\(schemaVersion):\(fileName ?? ""):\(checksum ?? "")"
         return Data(identity.utf8).sha256Hex
+    }
+
+    static func thumbnailURL(root: URL, id: UUID, schemaVersion: Int, fileName: String?, checksum: String?) -> URL {
+        root.appendingPathComponent("thumbnails", isDirectory: true)
+            .appendingPathComponent(id.uuidString, isDirectory: true)
+            .appendingPathComponent("\(thumbnailKey(schemaVersion: schemaVersion, fileName: fileName, checksum: checksum)).png")
     }
 
     private func thumbnailDirectory(for note: NoteRecord) -> URL {
@@ -264,15 +274,19 @@ final class NotePersistenceController {
     }
 
     private func thumbnailURL(for note: NoteRecord) -> URL {
-        thumbnailDirectory(for: note).appendingPathComponent("\(Self.thumbnailKey(for: note)).png")
+        Self.thumbnailURL(root: fileSystem.rootURL, id: note.id, schemaVersion: note.drawingSchemaVersion, fileName: note.drawingFileName, checksum: note.drawingChecksum)
     }
 
     @discardableResult
     func regenerateThumbnail(for note: NoteRecord, drawing: PKDrawing) throws -> URL {
+        let image = drawing.image(from: CGRect(x: 0, y: 0, width: 1200, height: 900), scale: 1)
+        return try storeThumbnail(image, for: note)
+    }
+
+    private func storeThumbnail(_ image: UIImage, for note: NoteRecord) throws -> URL {
         let directory = thumbnailDirectory(for: note)
         try fileSystem.createDirectory(at: directory)
         let url = thumbnailURL(for: note)
-        let image = drawing.image(from: CGRect(x: 0, y: 0, width: 1200, height: 900), scale: 1)
         guard let data = image.pngData() else { throw NotePersistenceError.invalidDrawingData }
         let temporaryURL = directory.appendingPathComponent(".\(UUID().uuidString).tmp")
         do {
@@ -302,7 +316,7 @@ final class NotePersistenceController {
         }
         guard let drawing = try? loadDrawing(for: note) else { return nil }
         let image = drawing.image(from: CGRect(x: 0, y: 0, width: 1200, height: 900), scale: 1)
-        _ = try? regenerateThumbnail(for: note, drawing: drawing)
+        _ = try? storeThumbnail(image, for: note)
         return image
     }
 
