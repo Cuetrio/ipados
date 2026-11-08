@@ -7,6 +7,8 @@ import XCTest
 
 @MainActor
 final class CornellNoteTests: XCTestCase {
+    private static let fixtureRunID = UUID().uuidString.lowercased()
+
     func testDiskMetadataTransactionCommitAndRollbackObservations() throws {
         enum InjectedFailure: Error { case afterInsert }
 
@@ -2673,8 +2675,34 @@ final class CornellNoteTests: XCTestCase {
         try FileManager.default.removeItem(at: url)
     }
 
+    func testTemporaryFixturesHaveOneOwnedRunRoot() throws {
+        let first = try makeTemporaryDirectory()
+        let second = try makeTemporaryDirectory()
+        defer {
+            try? removeTemporaryDirectory(at: first)
+            try? removeTemporaryDirectory(at: second)
+        }
+        let runRoot = first.deletingLastPathComponent()
+        XCTAssertEqual(runRoot, second.deletingLastPathComponent())
+        XCTAssertEqual(runRoot.lastPathComponent, Self.fixtureRunID)
+        let owner = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(contentsOf: runRoot.appendingPathComponent("owner.json"))) as? [String: Any])
+        XCTAssertEqual(owner["schema"] as? Int, 1)
+        XCTAssertEqual(owner["runID"] as? String, Self.fixtureRunID)
+        XCTAssertEqual(owner["hostPID"] as? Int, Int(ProcessInfo.processInfo.processIdentifier))
+    }
+
     private func makeTemporaryDirectory() throws -> URL {
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("CornellNoteTests-\(UUID().uuidString)", isDirectory: true)
+        let runRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CornellNoteTestRuns", isDirectory: true)
+            .appendingPathComponent(Self.fixtureRunID, isDirectory: true)
+        try FileManager.default.createDirectory(at: runRoot, withIntermediateDirectories: true)
+        let ownerURL = runRoot.appendingPathComponent("owner.json")
+        if !FileManager.default.fileExists(atPath: ownerURL.path) {
+            let owner: [String: Any] = ["schema": 1, "runID": Self.fixtureRunID, "hostPID": Int(ProcessInfo.processInfo.processIdentifier)]
+            try JSONSerialization.data(withJSONObject: owner, options: [.sortedKeys]).write(to: ownerURL, options: .withoutOverwriting)
+            print("CornellNote fixture run: \(Self.fixtureRunID)")
+        }
+        let url = runRoot.appendingPathComponent("CornellNoteTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
     }

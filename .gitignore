@@ -21,5 +21,8 @@ build/
 *.sqlite-wal
 *.store
 
+# Python test-helper bytecode
+/scripts/__pycache__/
+
 # Local verification records (dated work directories)
 /test/*-20[0-9][0-9][0-9][0-9][0-9][0-9]/
