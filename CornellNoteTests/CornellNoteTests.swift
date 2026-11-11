@@ -82,6 +82,47 @@ final class CornellNoteTests: XCTestCase {
         XCTAssertFalse(LibraryBackupActions.isLowCapacity(LibraryBackupActions.lowCapacityWarningBytes))
     }
 
+    func testLibraryCapacityRestrictionRecoversAndAllowsUnknownCapacity() {
+        let threshold = LibraryBackupActions.lowCapacityWarningBytes
+        XCTAssertTrue(LibraryBackupActions.isLowCapacity(threshold - 1))
+        XCTAssertFalse(LibraryBackupActions.isLowCapacity(threshold))
+        XCTAssertFalse(LibraryBackupActions.isLowCapacity(nil))
+    }
+
+    func testLibraryCreateMetadataFailureRemovesInsertedNote() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? removeTemporaryDirectory(at: root) }
+        let container = try NotePersistenceController.makeContainer(fileSystem: LocalNoteFileSystem(rootURL: root))
+        let context = ModelContext(container)
+        context.autosaveEnabled = false
+        let created = LibraryView.createNote(in: context) { throw NotePersistenceError.metadataCommitFailed }
+        XCTAssertFalse(created)
+        XCTAssertTrue(try context.fetch(FetchDescriptor<NoteRecord>()).isEmpty)
+        XCTAssertTrue(try ModelContext(container).fetch(FetchDescriptor<NoteRecord>()).isEmpty)
+        try context.save()
+        XCTAssertTrue(try ModelContext(container).fetch(FetchDescriptor<NoteRecord>()).isEmpty)
+    }
+
+    func testLibraryDeleteMetadataFailureReportsFailureAndRetainsNote() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? removeTemporaryDirectory(at: root) }
+        let fileSystem = LocalNoteFileSystem(rootURL: root)
+        let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
+        let context = ModelContext(container)
+        context.autosaveEnabled = false
+        let note = NoteRecord()
+        context.insert(note)
+        try context.save()
+        let noteID = note.id
+        let controller = NotePersistenceController(modelContext: context, fileSystem: fileSystem, commitMetadata: { throw NotePersistenceError.metadataCommitFailed })
+        XCTAssertFalse(LibraryView.performDelete { try controller.delete(note: note) })
+        XCTAssertEqual(try context.fetch(FetchDescriptor<NoteRecord>()).map(\.id), [noteID])
+        XCTAssertEqual(try ModelContext(container).fetch(FetchDescriptor<NoteRecord>()).map(\.id), [noteID])
+        try context.save()
+        XCTAssertEqual(try context.fetch(FetchDescriptor<NoteRecord>()).map(\.id), [noteID])
+        XCTAssertEqual(try ModelContext(container).fetch(FetchDescriptor<NoteRecord>()).map(\.id), [noteID])
+    }
+
     func testNewNoteUsesUntitledDisplayTitle() {
         let note = NoteRecord()
 

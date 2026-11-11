@@ -337,7 +337,8 @@ final class NotePersistenceController {
         do {
             try commitMetadata()
         } catch {
-            modelContext.insert(note)
+            // Re-inserting a deleted model does not cancel the pending deletion.
+            modelContext.rollback()
             throw NotePersistenceError.metadataCommitFailed
         }
         try fileSystem.removeItem(at: drawingsDirectory(for: note))

@@ -126,10 +126,13 @@ struct LibraryBackupActions: ViewModifier {
         return capacity < lowCapacityWarningBytes
     }
 
-    private func refreshCapacity() {
-        let root = fileSystem.rootURL
-        capacity = try? root.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+    static func availableCapacity(at root: URL) -> Int64? {
+        try? root.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
             .volumeAvailableCapacityForImportantUsage
+    }
+
+    private func refreshCapacity() {
+        capacity = Self.availableCapacity(at: fileSystem.rootURL)
     }
 
     private func beginBackupExport() {
