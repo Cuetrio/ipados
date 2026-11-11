@@ -123,6 +123,29 @@ final class CornellNoteTests: XCTestCase {
         XCTAssertEqual(try ModelContext(container).fetch(FetchDescriptor<NoteRecord>()).map(\.id), [noteID])
     }
 
+    func testDeleteCleanupFailuresStillRemoveMetadataAndAttemptEveryFile() throws {
+        for failedIndex in 0..<3 {
+            let root = try makeTemporaryDirectory()
+            defer { try? removeTemporaryDirectory(at: root) }
+            let fileSystem = FaultInjectingFileSystem(rootURL: root)
+            let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem, inMemory: true)
+            let context = ModelContext(container)
+            let note = NoteRecord()
+            context.insert(note)
+            try context.save()
+            let paths = [
+                root.appendingPathComponent("drawings/\(note.id.uuidString)", isDirectory: true),
+                root.appendingPathComponent("thumbnails/\(note.id.uuidString)", isDirectory: true),
+                root.appendingPathComponent("thumbnails/\(note.id.uuidString).png")
+            ]
+            fileSystem.failedRemovalURLs = [paths[failedIndex]]
+            let controller = NotePersistenceController(modelContext: context, fileSystem: fileSystem)
+            XCTAssertTrue(LibraryView.performDelete { try controller.delete(note: note) })
+            XCTAssertEqual(fileSystem.removalAttempts, paths)
+            XCTAssertTrue(try context.fetch(FetchDescriptor<NoteRecord>()).isEmpty)
+        }
+    }
+
     func testNewNoteUsesUntitledDisplayTitle() {
         let note = NoteRecord()
 
@@ -1044,6 +1067,31 @@ final class CornellNoteTests: XCTestCase {
         XCTAssertEqual(current.title, "Current")
     }
 
+    func testExportPreflightsEncodedSizeBeforeStagingAndExplainsFailures() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? removeTemporaryDirectory(at: root) }
+        let fileSystem = FaultInjectingFileSystem(rootURL: root)
+        let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem, inMemory: true)
+        let context = ModelContext(container)
+        let note = NoteRecord(title: "Current")
+        context.insert(note)
+        try context.save()
+        let clock = FixedBackupClock(now: Date(timeIntervalSince1970: 30))
+        let data = try BackupEnvelopeCodec().encode(metadata: BackupMetadata(noteRecords: [note]), drawings: [],
+            createdAtUnixNanos: BackupTimestamp.unixNanos(clock.now))
+        let provider = RecordingDocumentProvider()
+        let coordinator = BackupExportCoordinator(modelContext: context, fileSystem: fileSystem, clock: clock, provider: provider)
+        fileSystem.availableCapacity = Int64(data.count) - 1
+        XCTAssertThrowsError(try coordinator.export(to: root.appendingPathComponent("export.backup")))
+        XCTAssertFalse(fileSystem.fileExists(at: root.appendingPathComponent(".backup-staging")))
+        XCTAssertFalse(provider.didExport)
+        fileSystem.availableCapacity = Int64(data.count)
+        XCTAssertEqual(try coordinator.makeVerifiedEnvelope(), data)
+        let message = LibraryBackupActions.exportFailureMessage("書き出せませんでした。")
+        XCTAssertTrue(message.contains("書き出せませんでした。"))
+        XCTAssertTrue(message.contains("一時的な作業用の空き容量"))
+    }
+
     func testProviderFailureVectorsNeverBecomeSuccessfulExport() throws {
         let root = try makeTemporaryDirectory()
         defer { try? removeTemporaryDirectory(at: root) }
@@ -1060,6 +1108,36 @@ final class CornellNoteTests: XCTestCase {
         for (index, failure) in failures.enumerated() {
             provider.failure = failure
             XCTAssertThrowsError(try coordinator.export(to: root.appendingPathComponent("provider-failure-\(index).backup")))
+        }
+    }
+
+    func testRestoreUnsupportedSchemaShowsExplanationAndPreservesCurrentData() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? removeTemporaryDirectory(at: root) }
+        let fileSystem = FaultInjectingFileSystem(rootURL: root)
+        let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem, inMemory: true)
+        let context = ModelContext(container)
+        let note = NoteRecord(title: "Current")
+        context.insert(note)
+        try context.save()
+        let data = try makeSimpleBackupData(title: "Imported")
+        let errors: [BackupEnvelopeError] = [.unsupportedEnvelopeSchema(2), .unsupportedAppDataSchema(2), .unsupportedDrawingSchema(2), .invalidMetadata]
+        for error in errors {
+            let switcher = RecordingModelStoreSwitcher()
+            let coordinator = BackupRestoreCoordinator(modelContext: context, fileSystem: fileSystem,
+                decoder: FailingBackupDecoder(error: error), modelStoreSwitcher: switcher, markerStore: RecordingMarkerStore())
+            let result = coordinator.restore(from: data)
+            XCTAssertEqual(result.state, .restoreFailed)
+            XCTAssertFalse(switcher.didSwitch)
+            XCTAssertEqual(note.title, "Current")
+            XCTAssertEqual(try context.fetch(FetchDescriptor<NoteRecord>()).count, 1)
+            if error == .invalidMetadata {
+                XCTAssertNil(LibraryBackupActions.restoreFailureMessage(result))
+            } else {
+                let message = try XCTUnwrap(LibraryBackupActions.restoreFailureMessage(result))
+                XCTAssertTrue(message.contains("対応していません"))
+                XCTAssertTrue(message.contains("schemaは1"))
+            }
         }
     }
 
@@ -1612,7 +1690,7 @@ final class CornellNoteTests: XCTestCase {
         try assertReopenedStore(root: root, equals: saved)
     }
 
-    func testTitleOnlySaveNeedsNoCapacityOrDrawingWriteAndRollsBackFailedCommit() throws {
+    func testTitleOnlySaveChecksCapacityWithoutDrawingWriteAndRollsBackFailedCommit() throws {
         let root = try makeTemporaryDirectory()
         defer { try? removeTemporaryDirectory(at: root) }
         var committed: SavedNoteSnapshot!
@@ -1649,9 +1727,19 @@ final class CornellNoteTests: XCTestCase {
             XCTAssertEqual(session.titleDraft, "Failed title")
             XCTAssertEqual(try SavedNoteSnapshot(note: note, root: root), original)
 
-            // No capacity is needed and any drawing write would fail the save.
+            // Insufficient or unavailable capacity must preserve the committed metadata.
             fileSystem.failMetadataCommit = false
-            fileSystem.availableCapacity = 0
+            fileSystem.availableCapacity = Int64(BackupRestoreCoordinator.capacityReserve) - 1
+            XCTAssertThrowsError(try controller.saveTitle(note: note, title: "Low")) { error in
+                guard case NotePersistenceError.insufficientCapacity = error else { return XCTFail("Unexpected error: \(error)") }
+            }
+            fileSystem.failCapacityRead = true
+            XCTAssertThrowsError(try controller.saveTitle(note: note, title: "Unknown")) { error in
+                guard case NotePersistenceError.insufficientCapacity = error else { return XCTFail("Unexpected error: \(error)") }
+            }
+            XCTAssertEqual(try SavedNoteSnapshot(note: note, root: root), original)
+            fileSystem.failCapacityRead = false
+            fileSystem.availableCapacity = Int64(BackupRestoreCoordinator.capacityReserve)
             fileSystem.failNextWrite = true
             session.updateTitle("After")
             session.flushSave()
@@ -3047,8 +3135,17 @@ private final class ControlledDebounceSleeper {
     }
 }
 
+private struct FailingBackupDecoder: BackupEnvelopeDecoder {
+    let error: BackupEnvelopeError
+
+    func decode(_ data: Data) throws -> DecodedBackupEnvelope { throw error }
+}
+
 private final class FaultInjectingFileSystem: LocalNoteFileSystem {
     var availableCapacity: Int64 = .max
+    var failCapacityRead = false
+    var failedRemovalURLs: Set<URL> = []
+    var removalAttempts: [URL] = []
     var corruptNextRead = false
     var failNextTemporaryRead = false
     var corruptNextTemporaryRead = false
@@ -3057,7 +3154,10 @@ private final class FaultInjectingFileSystem: LocalNoteFileSystem {
     var failMetadataCommit = false
     var didRemoveAnything = false
 
-    override func availableCapacity(for url: URL) throws -> Int64 { availableCapacity }
+    override func availableCapacity(for url: URL) throws -> Int64 {
+        if failCapacityRead { throw NotePersistenceError.insufficientCapacity }
+        return availableCapacity
+    }
 
     override func readData(at url: URL) throws -> Data {
         if failNextTemporaryRead && url.pathExtension == "tmp" {
@@ -3096,6 +3196,8 @@ private final class FaultInjectingFileSystem: LocalNoteFileSystem {
 
     override func removeItem(at url: URL) throws {
         didRemoveAnything = true
+        removalAttempts.append(url)
+        if failedRemovalURLs.contains(url) { throw NotePersistenceError.metadataCommitFailed }
         try super.removeItem(at: url)
     }
 

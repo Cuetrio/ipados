@@ -135,6 +135,16 @@ struct LibraryBackupActions: ViewModifier {
         capacity = Self.availableCapacity(at: fileSystem.rootURL)
     }
 
+    static func exportFailureMessage(_ reason: String) -> String {
+        "\(reason) 書き出しには一時的な作業用の空き容量が必要です。"
+    }
+
+    static func restoreFailureMessage(_ result: RestoreResult?) -> String? {
+        guard result?.state == .restoreFailed,
+              result?.errorDescription == BackupEnvelopeError.unsupportedSchemaDescription else { return nil }
+        return BackupEnvelopeError.unsupportedSchemaDescription
+    }
+
     private func beginBackupExport() {
         guard writeAdmission.isAllowed, !hasRetainedDraft else { return }
         do {
@@ -142,7 +152,7 @@ struct LibraryBackupActions: ViewModifier {
             backupDocument = CornellNoteBackupDocument(data: try coordinator.makeVerifiedEnvelope())
             isExportingBackup = true
         } catch {
-            transferError = error.localizedDescription
+            transferError = Self.exportFailureMessage(error.localizedDescription)
         }
     }
 
@@ -157,18 +167,22 @@ struct LibraryBackupActions: ViewModifier {
         let coordinator = BackupRestoreCoordinator(modelContext: modelContext, fileSystem: fileSystem, startup: startup)
         let restoreResult = try? coordinator.restore(from: url, provider: LocalDocumentProviderAdapter())
         restoreState = restoreResult?.state ?? .restoreFailed
-        if restoreResult == nil { transferError = "バックアップを読み込めませんでした。" }
+        if restoreResult == nil {
+            transferError = "バックアップを読み込めませんでした。"
+        } else if let message = Self.restoreFailureMessage(restoreResult) {
+            transferError = message
+        }
     }
 
     private func exportCompleted(_ result: Result<URL, Error>) {
         switch result {
         case .failure(let error):
-            transferError = error.localizedDescription
+            transferError = Self.exportFailureMessage(error.localizedDescription)
         case .success(let url):
             guard let data = try? Data(contentsOf: url),
                   data == backupDocument.data,
                   data.backupSHA256Hex == backupDocument.data.backupSHA256Hex else {
-                transferError = "書き出し先のバックアップを検証できませんでした。"
+                transferError = Self.exportFailureMessage("書き出し先のバックアップを検証できませんでした。")
                 return
             }
         }
