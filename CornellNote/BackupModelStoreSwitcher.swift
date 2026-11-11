@@ -10,6 +10,10 @@ struct NoteStoreSelection: Codable, Equatable {
     static let legacy = NoteStoreSelection(schema: 1, store: "legacy")
 }
 
+enum NoteStoreSelectionError: Error {
+    case unsupportedSchema
+}
+
 final class NoteStoreSelectionStore {
     let fileSystem: BackupFileSystem
     private var selectionURL: URL { fileSystem.rootURL.appendingPathComponent("active-store.json") }
@@ -44,6 +48,7 @@ final class NoteStoreSelectionStore {
             throw BackupRestoreError.currentDataUnavailable
         }
         let selection = try JSONDecoder().decode(NoteStoreSelection.self, from: data)
+        guard selection.schema == 1 else { throw NoteStoreSelectionError.unsupportedSchema }
         _ = try rootURL(for: selection)
         return selection
     }

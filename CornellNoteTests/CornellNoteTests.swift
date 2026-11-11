@@ -5,9 +5,79 @@ import SwiftData
 import XCTest
 @testable import CornellNote
 
+private enum MissingRequiredAttributeSchema {
+    @Model
+    final class NoteRecord {
+        var id: UUID
+        var createdAt: Date
+        var updatedAt: Date
+        var drawingFileName: String?
+        var drawingChecksum: String?
+        var drawingSchemaVersion: Int
+
+        init() {
+            id = UUID(uuidString: "22222222-2222-2222-2222-222222222222")!
+            createdAt = Date(timeIntervalSince1970: 30)
+            updatedAt = Date(timeIntervalSince1970: 40)
+            drawingFileName = "missing-title.drawing"
+            drawingChecksum = "missing-title checksum"
+            drawingSchemaVersion = 8
+        }
+    }
+}
+
 @MainActor
 final class CornellNoteTests: XCTestCase {
     private static let fixtureRunID = UUID().uuidString.lowercased()
+
+    func testMetadataStoreMissingRequiredAttributeIsRejectedAndPreserved() throws {
+        try assertIncompatibleMetadataStoreIsRejected(MissingRequiredAttributeSchema.NoteRecord()) { note in
+            XCTAssertEqual(note.id.uuidString, "22222222-2222-2222-2222-222222222222")
+            XCTAssertEqual(note.createdAt, Date(timeIntervalSince1970: 30))
+            XCTAssertEqual(note.updatedAt, Date(timeIntervalSince1970: 40))
+            XCTAssertEqual(note.drawingFileName, "missing-title.drawing")
+            XCTAssertEqual(note.drawingChecksum, "missing-title checksum")
+            XCTAssertEqual(note.drawingSchemaVersion, 8)
+        }
+    }
+
+    private func assertIncompatibleMetadataStoreIsRejected<T: PersistentModel>(
+        _ record: T, assertValues: (T) -> Void
+    ) throws {
+        let root = try makeTemporaryDirectory()
+        let fileSystem = LocalNoteFileSystem(rootURL: root)
+        let schema = Schema([T.self])
+        let configuration = ModelConfiguration(schema: schema, url: root.appendingPathComponent("metadata.store"))
+
+        func openOriginalAndCheck() throws {
+            let container = try ModelContainer(for: schema, configurations: [configuration])
+            let context = ModelContext(container)
+            context.autosaveEnabled = false
+            let records = try context.fetch(FetchDescriptor<T>())
+            XCTAssertEqual(records.count, 1)
+            if let first = records.first { assertValues(first) }
+        }
+
+        do {
+            let container = try ModelContainer(for: schema, configurations: [configuration])
+            let context = ModelContext(container)
+            context.autosaveEnabled = false
+            context.insert(record)
+            try context.save()
+        }
+        try openOriginalAndCheck()
+        XCTAssertThrowsError(try NotePersistenceController.makeContainer(fileSystem: fileSystem))
+        XCTAssertNoThrow(try openOriginalAndCheck())
+
+        let startup = NoteStartupController(fileSystem: fileSystem)
+        startup.recheck()
+        guard case .blocked = startup.state else {
+            XCTFail("An incompatible metadata store must not reach ready")
+            XCTAssertNoThrow(try openOriginalAndCheck())
+            return
+        }
+        XCTAssertNoThrow(try openOriginalAndCheck())
+    }
 
     func testDiskMetadataTransactionCommitAndRollbackObservations() throws {
         enum InjectedFailure: Error { case afterInsert }
@@ -1111,6 +1181,14 @@ final class CornellNoteTests: XCTestCase {
         }
     }
 
+    func testRestoreFailedGuidanceExplainsProtectionCapacityAndReimport() {
+        let message = LibraryBackupActions.restoreFailedGuidance
+        XCTAssertTrue(message.contains("既存のノートは保護されています"))
+        XCTAssertTrue(message.contains("空き容量を確認"))
+        XCTAssertTrue(message.contains("バックアップが破損している可能性"))
+        XCTAssertTrue(message.contains("別のバックアップを選んで読み込み直して"))
+    }
+
     func testRestoreUnsupportedSchemaShowsExplanationAndPreservesCurrentData() throws {
         let root = try makeTemporaryDirectory()
         defer { try? removeTemporaryDirectory(at: root) }
@@ -1347,9 +1425,21 @@ final class CornellNoteTests: XCTestCase {
             if corruption == "unknown-schema" {
                 try fileSystem.writeAndFlush(Data("{\"schema\":2,\"store\":\"legacy\"}".utf8), to: record)
             }
+            let before = try StartupFileSnapshot(root: root)
             let startup = NoteStartupController(fileSystem: fileSystem)
-            startup.recheck()
-            guard case .blocked = startup.state else { return XCTFail("Invalid selection was admitted: \(corruption)") }
+            for _ in 0..<2 {
+                startup.recheck()
+                guard case .blocked(let failure) = startup.state else { return XCTFail("Invalid selection was admitted: \(corruption)") }
+                if corruption == "unknown-schema" {
+                    XCTAssertEqual(failure, .unsupportedSelectionSchema)
+                    XCTAssertTrue(failure.message.contains("選択レコードのschemaには対応していません"))
+                    XCTAssertTrue(failure.message.contains("対応するschemaは1です"))
+                } else {
+                    XCTAssertEqual(failure, .storeOpenFailed)
+                    XCTAssertFalse(failure.message.contains("対応するschemaは1です"))
+                }
+                XCTAssertEqual(try StartupFileSnapshot(root: root), before)
+            }
             XCTAssertFalse(fileSystem.fileExists(at: root.appendingPathComponent("metadata.store")))
             XCTAssertFalse(fileSystem.fileExists(at: root.appendingPathComponent("generations/\(id)/metadata.store")))
         }
@@ -2423,6 +2513,8 @@ final class CornellNoteTests: XCTestCase {
                 markerStore.readError = BackupEnvelopeError.invalidManifest
             case .storeOpenFailed:
                 break
+            case .unsupportedSelectionSchema:
+                XCTFail("Selection schema is not part of this test")
             }
 
             startup.recheck() // The root's store-switch receiver uses this same entry point.
@@ -2451,6 +2543,7 @@ final class CornellNoteTests: XCTestCase {
         }
         startup.recheck()
         assertStartupBlocked(startup, by: .safetyCheckFailed)
+        XCTAssertTrue(NoteStartupFailure.safetyCheckFailed.message.contains("対応する復旧情報のschemaは1です"))
         XCTAssertEqual(opens, 0)
         XCTAssertEqual(try StartupFileSnapshot(root: root), corruptSnapshot)
         XCTAssertTrue(fileSystem.mutations.isEmpty)
@@ -2609,6 +2702,8 @@ final class CornellNoteTests: XCTestCase {
                     try fileSystem.writeAndFlush(Data("corrupt fallback".utf8), to: fallbackURL)
                 case .storeOpenFailed:
                     failOpen = true
+                case .unsupportedSelectionSchema:
+                    XCTFail("Selection schema is not part of this test")
                 }
                 let before = try StartupFileSnapshot(root: root)
                 fileSystem.mutations.removeAll()

@@ -70,7 +70,7 @@ struct LibraryBackupActions: ViewModifier {
                                 LabeledContent("復元結果", value: "なし")
                             }
                             if restoreState == .restoreFailed {
-                                Text("復元できませんでした。既存のノートは保護されています。空き容量とバックアップを確認してください。")
+                                Text(Self.restoreFailedGuidance)
                             }
                         }
                     }
@@ -138,6 +138,8 @@ struct LibraryBackupActions: ViewModifier {
     static func exportFailureMessage(_ reason: String) -> String {
         "\(reason) 書き出しには一時的な作業用の空き容量が必要です。"
     }
+
+    static let restoreFailedGuidance = "復元できませんでした。既存のノートは保護されています。空き容量を確認してください。バックアップが破損している可能性があります。別のバックアップを選んで読み込み直してください。"
 
     static func restoreFailureMessage(_ result: RestoreResult?) -> String? {
         guard result?.state == .restoreFailed,
