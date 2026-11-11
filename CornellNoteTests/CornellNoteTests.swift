@@ -1141,6 +1141,59 @@ final class CornellNoteTests: XCTestCase {
         }
     }
 
+    func testRestoreRealUnsupportedSchemasPreservesCurrentData() throws {
+        let fixture = try makeSimpleBackupData(title: "Imported")
+        let manifestRange = try XCTUnwrap(fixture.manifestByteRangeForTest)
+        let metadataStart = manifestRange.upperBound + 1 + 4 + "metadata.json".utf8.count + 8
+        let metadataRange = metadataStart..<(fixture.count - BackupEnvelopeCodec.footerLength)
+        let originalMetadata = fixture.subdata(in: metadataRange)
+        let cases: [(String, BackupEnvelopeError)] = [
+            ("envelopeSchema", .unsupportedEnvelopeSchema(2)),
+            ("appDataSchema", .unsupportedAppDataSchema(2)),
+            ("drawingSchemaVersion", .unsupportedDrawingSchema(2))
+        ]
+
+        for (key, expectedError) in cases {
+            // A failed restore reopens the store, so each case starts from its own store.
+            let root = try makeTemporaryDirectory()
+            defer { try? removeTemporaryDirectory(at: root) }
+            let startup = NoteStartupController(fileSystem: LocalNoteFileSystem(rootURL: root))
+            startup.recheck()
+            guard case .ready(let original) = startup.state else { return XCTFail("Store did not open") }
+            let context = ModelContext(original.container)
+            context.insert(NoteRecord(title: "Current"))
+            try context.save()
+
+            var data = fixture
+            let marker = Data("\"\(key)\":1".utf8)
+            let replacement = Data("\"\(key)\":2".utf8)
+            let searchRange = key == "drawingSchemaVersion" ? metadataRange : manifestRange
+            let range = try XCTUnwrap(data.range(of: marker, in: searchRange))
+            data.replaceSubrange(range, with: replacement)
+            if key == "drawingSchemaVersion" {
+                let updatedMetadata = data.subdata(in: metadataRange)
+                let oldHash = Data(originalMetadata.sha256HexForTest.utf8)
+                let newHash = Data(updatedMetadata.sha256HexForTest.utf8)
+                let hashRange = try XCTUnwrap(data.range(of: oldHash, in: manifestRange))
+                data.replaceSubrange(hashRange, with: newHash)
+            }
+            let footerHashStart = data.count - 32
+            let body = Data(data.prefix(data.count - BackupEnvelopeCodec.footerLength))
+            data.replaceSubrange(footerHashStart..<data.count, with: Data(SHA256.hash(data: body)))
+
+            XCTAssertThrowsError(try BackupEnvelopeCodec().decode(data), key) { error in
+                XCTAssertEqual(error as? BackupEnvelopeError, expectedError, key)
+            }
+            let coordinator = BackupRestoreCoordinator(modelContext: context, fileSystem: original.fileSystem, startup: startup)
+            let result = coordinator.restore(from: data)
+            XCTAssertEqual(result.state, .restoreFailed, key)
+            XCTAssertEqual(LibraryBackupActions.restoreFailureMessage(result), BackupEnvelopeError.unsupportedSchemaDescription, key)
+            guard case .ready(let reopened) = startup.state else { return XCTFail("Store did not reopen: \(key)") }
+            let notes = try ModelContext(reopened.container).fetch(FetchDescriptor<NoteRecord>())
+            XCTAssertEqual(notes.map(\.title), ["Current"], key)
+        }
+    }
+
     func testThumbnailRegenerationFailureDoesNotInvalidateRestore() throws {
         let root = try makeTemporaryDirectory()
         defer { try? removeTemporaryDirectory(at: root) }
