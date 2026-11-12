@@ -5,12 +5,13 @@ enum NoteStartupFailure: Equatable {
     case recoveryRequired
     case safetyCheckFailed
     case storeOpenFailed
+    case unsupportedSelectionSchema
 
     var title: String {
         switch self {
         case .recoveryRequired: return "復旧が必要です"
         case .safetyCheckFailed: return "保存領域の安全性を確認できません"
-        case .storeOpenFailed: return "保存領域を開けません"
+        case .storeOpenFailed, .unsupportedSelectionSchema: return "保存領域を開けません"
         }
     }
 
@@ -19,9 +20,11 @@ enum NoteStartupFailure: Equatable {
         case .recoveryRequired:
             return "前回の復元が完了していない可能性があります。元のデータと安全バックアップを保護するため、ノートの一覧と編集を開きません。再確認で復旧情報を解除したり、データを修復・削除したりすることはありません。"
         case .safetyCheckFailed:
-            return "復旧情報が読み取れないか、破損しているか、未対応のschemaです。安全バックアップ内の復旧情報を確認できない場合も、ノートを開きません。元のデータと安全バックアップは変更せず、安全性の確認だけを再試行できます。"
+            return "復旧情報が読み取れないか、破損しているか、未対応のschemaです。対応する復旧情報のschemaは1です。安全バックアップ内の復旧情報を確認できない場合も、ノートを開きません。元のデータと安全バックアップは変更せず、安全性の確認だけを再試行できます。"
         case .storeOpenFailed:
             return "復旧情報の確認後に保存領域を開けませんでした。端末の空き容量や利用可能な状態を確認してから再試行してください。再試行でも復旧情報を先に確認します。データの初期化や自動修復は行いません。"
+        case .unsupportedSelectionSchema:
+            return "保存領域の選択レコードのschemaには対応していません。対応するschemaは1です。再試行でも復旧情報を先に確認します。データの初期化や自動修復は行いません。"
         }
     }
 }
@@ -176,6 +179,8 @@ final class NoteStartupController {
             }
             container.mainContext.autosaveEnabled = false
             state = .ready(NoteStoreGeneration(container: container, fileSystem: selectedFileSystem))
+        } catch NoteStoreSelectionError.unsupportedSchema {
+            state = .blocked(.unsupportedSelectionSchema)
         } catch {
             state = .blocked(.storeOpenFailed)
         }

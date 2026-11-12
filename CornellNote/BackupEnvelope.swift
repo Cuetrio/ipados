@@ -22,11 +22,13 @@ enum BackupEnvelopeError: Error, Equatable, LocalizedError {
     case missingDrawingRecord(String)
     case unexpectedDrawingRecord(String)
 
+    static let unsupportedSchemaDescription = "このバックアップのschemaには対応していません。対応するschemaは1です。"
+
     var errorDescription: String? {
         switch self {
         case .truncated: return "Backup envelope is truncated."
         case .invalidMagic: return "Backup envelope magic is invalid."
-        case .unsupportedEnvelopeSchema(let value): return "Unsupported envelope schema: \(value)."
+        case .unsupportedEnvelopeSchema: return Self.unsupportedSchemaDescription
         case .invalidManifest: return "Backup manifest is invalid."
         case .nonCanonicalManifest: return "Backup manifest is not canonical JSON."
         case .invalidUTF8: return "Backup record path is not valid UTF-8."
@@ -38,9 +40,9 @@ enum BackupEnvelopeError: Error, Equatable, LocalizedError {
         case .payloadSizeMismatch(let path): return "Backup payload size does not match: \(path)."
         case .payloadHashMismatch(let path): return "Backup payload hash does not match: \(path)."
         case .footerHashMismatch: return "Backup envelope footer hash does not match."
-        case .unsupportedAppDataSchema(let value): return "Unsupported app data schema: \(value)."
+        case .unsupportedAppDataSchema: return Self.unsupportedSchemaDescription
         case .invalidMetadata: return "Backup metadata is invalid."
-        case .unsupportedDrawingSchema(let value): return "Unsupported drawing schema: \(value)."
+        case .unsupportedDrawingSchema: return Self.unsupportedSchemaDescription
         case .missingDrawingRecord(let path): return "Backup drawing record is missing: \(path)."
         case .unexpectedDrawingRecord(let path): return "Backup drawing record is not referenced by metadata: \(path)."
         }

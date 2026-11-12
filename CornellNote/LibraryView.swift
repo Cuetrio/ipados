@@ -10,6 +10,10 @@ struct LibraryView: View {
     @Binding var restoreState: RestoreState?
     @State private var editingSession: NoteEditingSession?
     @State private var isEditorPresented = false
+    @State private var capacity: Int64?
+    @State private var operationError: String?
+
+    private var isLowCapacity: Bool { LibraryBackupActions.isLowCapacity(capacity) }
 
     private var hasRetainedDraft: Bool {
         editingSession?.hasUnsavedChanges == true
@@ -24,6 +28,9 @@ struct LibraryView: View {
             List {
                 if notes.isEmpty {
                     ContentUnavailableView("ノートはありません", systemImage: "note.text")
+                }
+                if isLowCapacity {
+                    Text("空き容量が100 MB未満のため、新規ノートを作成できません。容量を確保してください。")
                 }
                 if hasRetainedDraft {
                     Button("未保存の変更があります。編集に戻って保存または破棄してください。") {
@@ -80,7 +87,7 @@ struct LibraryView: View {
                     Button(action: createNote) {
                         Label("新規ノート", systemImage: "plus")
                     }
-                    .disabled(hasRetainedDraft)
+                    .disabled(hasRetainedDraft || isLowCapacity)
                 }
             }
             .alert("ノートを削除しますか？", isPresented: Binding(
@@ -91,6 +98,20 @@ struct LibraryView: View {
                 Button("キャンセル", role: .cancel) { noteToDelete = nil }
             } message: {
                 Text("削除したノートは元に戻せません。")
+            }
+            .alert("操作に失敗しました", isPresented: Binding(
+                get: { operationError != nil },
+                set: { if !$0 { operationError = nil } }
+            )) {
+                Button("閉じる", role: .cancel) { operationError = nil }
+            } message: {
+                Text(operationError ?? "")
+            }
+            .task {
+                while !Task.isCancelled {
+                    refreshCapacity()
+                    try? await Task.sleep(for: .seconds(2))
+                }
             }
             .modifier(LibraryBackupActions(
                 fileSystem: fileSystem,
@@ -126,23 +147,47 @@ struct LibraryView: View {
         isEditorPresented = true
     }
 
-    private func createNote() {
-        guard writeAdmission.isAllowed, !hasRetainedDraft else { return }
+    private func refreshCapacity() {
+        capacity = LibraryBackupActions.availableCapacity(at: fileSystem.rootURL)
+    }
+
+    static func createNote(in context: ModelContext, save: () throws -> Void) -> Bool {
         let note = NoteRecord()
-        modelContext.insert(note)
+        context.insert(note)
         do {
-            try modelContext.save()
+            try save()
+            return true
         } catch {
-            modelContext.delete(note)
+            context.delete(note)
+            return false
+        }
+    }
+
+    static func performDelete(_ delete: () throws -> Void) -> Bool {
+        do {
+            try delete()
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private func createNote() {
+        refreshCapacity()
+        guard writeAdmission.isAllowed, !hasRetainedDraft, !isLowCapacity else { return }
+        if !Self.createNote(in: modelContext, save: { try modelContext.save() }) {
+            operationError = "ノートを作成できませんでした。空き容量を確認してください。"
         }
     }
 
     private func deleteSelectedNote() {
-        guard writeAdmission.isAllowed, !hasRetainedDraft, let note = noteToDelete else { return }
-        do {
+        guard let note = noteToDelete else { return }
+        noteToDelete = nil
+        guard writeAdmission.isAllowed, !hasRetainedDraft else { return }
+        if !Self.performDelete({
             try NotePersistenceController(modelContext: modelContext, fileSystem: fileSystem, canWrite: { [writeAdmission] in writeAdmission.isAllowed }).delete(note: note)
-        } catch {
-            noteToDelete = nil
+        }) {
+            operationError = "ノートを削除できませんでした。もう一度お試しください。"
         }
     }
 }
