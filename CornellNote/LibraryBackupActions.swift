@@ -70,7 +70,7 @@ struct LibraryBackupActions: ViewModifier {
                                 LabeledContent("復元結果", value: "なし")
                             }
                             if restoreState == .restoreFailed {
-                                Text("復元できませんでした。既存のノートは保護されています。空き容量とバックアップを確認してください。")
+                                Text(Self.restoreFailedGuidance)
                             }
                         }
                     }
@@ -126,10 +126,25 @@ struct LibraryBackupActions: ViewModifier {
         return capacity < lowCapacityWarningBytes
     }
 
-    private func refreshCapacity() {
-        let root = fileSystem.rootURL
-        capacity = try? root.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+    static func availableCapacity(at root: URL) -> Int64? {
+        try? root.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
             .volumeAvailableCapacityForImportantUsage
+    }
+
+    private func refreshCapacity() {
+        capacity = Self.availableCapacity(at: fileSystem.rootURL)
+    }
+
+    static func exportFailureMessage(_ reason: String) -> String {
+        "\(reason) 書き出しには一時的な作業用の空き容量が必要です。"
+    }
+
+    static let restoreFailedGuidance = "復元できませんでした。既存のノートは保護されています。空き容量を確認してください。バックアップが破損している可能性があります。別のバックアップを選んで読み込み直してください。"
+
+    static func restoreFailureMessage(_ result: RestoreResult?) -> String? {
+        guard result?.state == .restoreFailed,
+              result?.errorDescription == BackupEnvelopeError.unsupportedSchemaDescription else { return nil }
+        return BackupEnvelopeError.unsupportedSchemaDescription
     }
 
     private func beginBackupExport() {
@@ -139,7 +154,7 @@ struct LibraryBackupActions: ViewModifier {
             backupDocument = CornellNoteBackupDocument(data: try coordinator.makeVerifiedEnvelope())
             isExportingBackup = true
         } catch {
-            transferError = error.localizedDescription
+            transferError = Self.exportFailureMessage(error.localizedDescription)
         }
     }
 
@@ -154,18 +169,22 @@ struct LibraryBackupActions: ViewModifier {
         let coordinator = BackupRestoreCoordinator(modelContext: modelContext, fileSystem: fileSystem, startup: startup)
         let restoreResult = try? coordinator.restore(from: url, provider: LocalDocumentProviderAdapter())
         restoreState = restoreResult?.state ?? .restoreFailed
-        if restoreResult == nil { transferError = "バックアップを読み込めませんでした。" }
+        if restoreResult == nil {
+            transferError = "バックアップを読み込めませんでした。"
+        } else if let message = Self.restoreFailureMessage(restoreResult) {
+            transferError = message
+        }
     }
 
     private func exportCompleted(_ result: Result<URL, Error>) {
         switch result {
         case .failure(let error):
-            transferError = error.localizedDescription
+            transferError = Self.exportFailureMessage(error.localizedDescription)
         case .success(let url):
             guard let data = try? Data(contentsOf: url),
                   data == backupDocument.data,
                   data.backupSHA256Hex == backupDocument.data.backupSHA256Hex else {
-                transferError = "書き出し先のバックアップを検証できませんでした。"
+                transferError = Self.exportFailureMessage("書き出し先のバックアップを検証できませんでした。")
                 return
             }
         }

@@ -2,6 +2,12 @@ import Foundation
 import PencilKit
 import SwiftData
 
+enum BackupExportError: Error, LocalizedError {
+    case insufficientCapacity
+
+    var errorDescription: String? { "バックアップの書き出しに必要な空き容量を確保できませんでした。" }
+}
+
 struct BackupExportResult {
     let stagingURL: URL
     let destinationURL: URL
@@ -74,6 +80,10 @@ final class BackupExportCoordinator {
             createdAtUnixNanos: BackupTimestamp.unixNanos(clock.now)
         )
 
+        guard let capacity = try? fileSystem.availableCapacity(for: fileSystem.rootURL),
+              capacity >= 0, UInt64(capacity) >= UInt64(data.count) else {
+            throw BackupExportError.insufficientCapacity
+        }
         let directory = fileSystem.rootURL.appendingPathComponent(".backup-staging", isDirectory: true)
         try fileSystem.createDirectory(at: directory)
         let url = directory.appendingPathComponent("export-\(uuidSource.makeUUID().uuidString.lowercased()).cornellnote-backup")

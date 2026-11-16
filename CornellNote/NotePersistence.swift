@@ -222,11 +222,15 @@ final class NotePersistenceController {
     }
 
     /// Commits a title change while keeping the verified active drawing generation.
-    /// No drawing bytes are serialized, written, or copied, so no capacity is required.
+    /// No drawing bytes are serialized, written, or copied.
     func saveTitle(note: NoteRecord, title: String) throws {
         guard canWrite() else { throw BackupRestoreError.restoreUnavailable }
         guard note.drawingSchemaVersion == Self.drawingSchemaVersion else {
             throw NotePersistenceError.unsupportedDrawingSchema
+        }
+        guard let capacity = try? fileSystem.availableCapacity(for: fileSystem.rootURL),
+              capacity >= Int64(BackupRestoreCoordinator.capacityReserve) else {
+            throw NotePersistenceError.insufficientCapacity
         }
         let autosaveEnabled = modelContext.autosaveEnabled
         modelContext.autosaveEnabled = false
@@ -337,12 +341,13 @@ final class NotePersistenceController {
         do {
             try commitMetadata()
         } catch {
-            modelContext.insert(note)
+            // Re-inserting a deleted model does not cancel the pending deletion.
+            modelContext.rollback()
             throw NotePersistenceError.metadataCommitFailed
         }
-        try fileSystem.removeItem(at: drawingsDirectory(for: note))
-        try fileSystem.removeItem(at: thumbnailDirectory(for: note))
-        try fileSystem.removeItem(at: fileSystem.rootURL.appendingPathComponent("thumbnails", isDirectory: true).appendingPathComponent("\(note.id.uuidString).png"))
+        try? fileSystem.removeItem(at: drawingsDirectory(for: note))
+        try? fileSystem.removeItem(at: thumbnailDirectory(for: note))
+        try? fileSystem.removeItem(at: fileSystem.rootURL.appendingPathComponent("thumbnails", isDirectory: true).appendingPathComponent("\(note.id.uuidString).png"))
     }
 
     func cleanupOrphans(for note: NoteRecord) {
