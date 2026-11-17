@@ -11,7 +11,7 @@ import subprocess
 import uuid
 
 
-APP_BUNDLE_ID = "com.cornellmethod.notebook.ipad.dev"
+APP_BUNDLE_ID = "com.cornellmethod.notebook.ipad"
 
 
 def run_root(container, run_id):
