@@ -2,7 +2,9 @@
 
 Cornell Note for iPad targets iPadOS 17+ as a local-first, on-device app. Mac integration, a cloud backend, and authentication are not initial requirements.
 
-The initial version is in development with SwiftUI, PencilKit, and SwiftData. The features in the specification are implemented: the library, the editor (tools, undo/redo, pinch zoom, landscape only), drawing autosave with save/read protection, the settings/backup screen with backup export and restore, thumbnail updates, and the startup recovery check. On-device acceptance on an iPad with Apple Pencil and the signing and release configuration remain.
+The initial version is in development with SwiftUI, PencilKit, and SwiftData. The features in the specification are implemented: the library, the editor (tools, undo/redo, pinch zoom, landscape only), drawing autosave with save/read protection, the settings/backup screen with backup export and restore, thumbnail updates, and the startup recovery check. The release identity is set (bundle identifier `com.cornellmethod.notebook.ipad`, display name Cornell Note, version 1.0.0), and on-device acceptance on an iPad with Apple Pencil (iPadOS 17) has passed.
+
+The initial release is a direct install onto your own iPad. Choose your signing team in Xcode, or pass `DEVELOPMENT_TEAM` on the command line; do not commit the team to the project. With a free Personal Team, the installed app stops launching after 7 days and must be installed again; notes are kept.
 
 Build and run the tests on an iPad simulator without signing:
 
