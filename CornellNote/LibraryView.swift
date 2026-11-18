@@ -8,8 +8,10 @@ struct LibraryView: View {
     @Query(sort: \NoteRecord.updatedAt, order: .reverse) private var notes: [NoteRecord]
     @State private var noteToDelete: NoteRecord?
     @Binding var restoreState: RestoreState?
+    @Binding var isSettingsPresented: Bool
     @State private var editingSession: NoteEditingSession?
     @State private var isEditorPresented = false
+    @State private var isNewEditingSession = false
     @State private var capacity: Int64?
     @State private var operationError: String?
 
@@ -47,7 +49,7 @@ struct LibraryView: View {
                                 VStack(alignment: .leading, spacing: 4) {
                                     Text(note.displayTitle)
                                         .font(.headline)
-                                    Text(note.updatedAt, style: .date)
+                                    Text(Self.japaneseDate(note.updatedAt))
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }
@@ -68,8 +70,14 @@ struct LibraryView: View {
             .navigationDestination(isPresented: $isEditorPresented) {
                 if let editingSession {
                     EditorView(session: editingSession) {
+                        if isNewEditingSession, editingSession.canEdit,
+                           editingSession.titleDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                           editingSession.drawingDraft.strokes.isEmpty {
+                            deleteNote(editingSession.note)
+                        }
                         isEditorPresented = false
                         self.editingSession = nil
+                        isNewEditingSession = false
                     }
                 }
             }
@@ -120,7 +128,8 @@ struct LibraryView: View {
                 hasRetainedDraft: hasRetainedDraft,
                 saveState: editingSession?.saveState ?? .saved,
                 lastSaved: notes.first?.updatedAt,
-                restoreState: $restoreState
+                restoreState: $restoreState,
+                isSettingsPresented: $isSettingsPresented
             ))
             .task {
                 guard writeAdmission.isAllowed else { return }
@@ -134,9 +143,10 @@ struct LibraryView: View {
         }
     }
 
-    private func openNote(_ note: NoteRecord) {
+    private func openNote(_ note: NoteRecord, isNew: Bool = false) {
         guard writeAdmission.isAllowed else { return }
         if !hasRetainedDraft {
+            isNewEditingSession = isNew
             editingSession = NoteEditingSession(
                 note: note,
                 persistence: NotePersistenceController(modelContext: modelContext, fileSystem: fileSystem, canWrite: { [writeAdmission] in writeAdmission.isAllowed }),
@@ -151,8 +161,13 @@ struct LibraryView: View {
         capacity = LibraryBackupActions.availableCapacity(at: fileSystem.rootURL)
     }
 
-    static func createNote(in context: ModelContext, save: () throws -> Void) -> Bool {
-        let note = NoteRecord()
+    static func japaneseDate(_ date: Date, includeTime: Bool = false) -> String {
+        let style = Date.FormatStyle(date: .abbreviated, time: includeTime ? .shortened : .omitted)
+            .locale(Locale(identifier: "ja_JP"))
+        return date.formatted(style)
+    }
+
+    static func createNote(in context: ModelContext, note: NoteRecord = NoteRecord(), save: () throws -> Void) -> Bool {
         context.insert(note)
         do {
             try save()
@@ -175,7 +190,10 @@ struct LibraryView: View {
     private func createNote() {
         refreshCapacity()
         guard writeAdmission.isAllowed, !hasRetainedDraft, !isLowCapacity else { return }
-        if !Self.createNote(in: modelContext, save: { try modelContext.save() }) {
+        let note = NoteRecord()
+        if Self.createNote(in: modelContext, note: note, save: { try modelContext.save() }) {
+            openNote(note, isNew: true)
+        } else {
             operationError = "ノートを作成できませんでした。空き容量を確認してください。"
         }
     }
@@ -184,6 +202,10 @@ struct LibraryView: View {
         guard let note = noteToDelete else { return }
         noteToDelete = nil
         guard writeAdmission.isAllowed, !hasRetainedDraft else { return }
+        deleteNote(note)
+    }
+
+    private func deleteNote(_ note: NoteRecord) {
         if !Self.performDelete({
             try NotePersistenceController(modelContext: modelContext, fileSystem: fileSystem, canWrite: { [writeAdmission] in writeAdmission.isAllowed }).delete(note: note)
         }) {

@@ -10,6 +10,11 @@ struct EditorView: View {
     @State private var canUndo = false
     @State private var canRedo = false
 
+    static func statusLabel(saveState: NoteSaveState, hasLoadFailure: Bool) -> String? {
+        if hasLoadFailure { return "Read failed" }
+        return saveState == .saveFailed ? saveState.label : nil
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             TextField("ノートのタイトル", text: Binding(
@@ -40,7 +45,7 @@ struct EditorView: View {
                     .padding(.horizontal)
                     .accessibilityElement(children: .contain)
                 }
-                if session.hasUnsavedChanges {
+                if session.hasUnsavedChanges && session.saveState == .saveFailed {
                     Text("未保存のタイトルと描画はメモリに保持しています。アプリの終了やOSによる強制終了の直前には保存を保証できず、失われる可能性があります。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -85,9 +90,11 @@ struct EditorView: View {
             ToolbarItemGroup(placement: .topBarTrailing) {
                 Button("保存") { session.flushSave() }
                     .disabled(!session.canEdit || !session.hasUnsavedChanges)
-                Text(session.loadFailureMessage == nil ? session.saveState.label : "Read failed")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                if let label = Self.statusLabel(saveState: session.saveState, hasLoadFailure: session.loadFailureMessage != nil) {
+                    Text(label)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
         }
         .alert("未保存の変更を破棄しますか？", isPresented: $isShowingLeaveWarning) {

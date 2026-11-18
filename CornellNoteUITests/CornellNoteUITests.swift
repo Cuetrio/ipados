@@ -18,12 +18,18 @@ final class SettingsBackupUITests: XCTestCase {
 
     func testLatestNoteDateRemainsAfterRelaunch() {
         let app = XCUIApplication()
+        app.launchArguments += ["-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
         app.launchEnvironment["CORNELL_NOTE_UI_TEST_STORE"] = UUID().uuidString
         app.launch()
         let create = app.buttons["新規ノート"]
         XCTAssertTrue(create.waitForExistence(timeout: 10))
         create.tap()
-        XCTAssertTrue(app.staticTexts["無題のノート"].waitForExistence(timeout: 5))
+        let title = app.textFields["ノートのタイトル"]
+        XCTAssertTrue(title.waitForExistence(timeout: 5))
+        title.tap()
+        title.typeText("Date test")
+        app.buttons["ライブラリ"].tap()
+        XCTAssertTrue(app.staticTexts["Date test"].waitForExistence(timeout: 5))
         let settings = app.buttons["設定 / バックアップ"]
         XCTAssertTrue(settings.waitForExistence(timeout: 10))
         settings.tap()
@@ -34,6 +40,9 @@ final class SettingsBackupUITests: XCTestCase {
         XCTAssertFalse(before?.isEmpty ?? true)
         XCTAssertNotEqual(before, "確認できません")
         XCTAssertGreaterThanOrEqual(before?.filter(\.isNumber).count ?? 0, 4, "The value must contain a formatted date")
+        XCTAssertTrue(before?.contains("年") == true)
+        XCTAssertTrue(before?.contains("月") == true)
+        XCTAssertTrue(before?.contains("日") == true)
         app.terminate()
         app.launch()
         XCTAssertTrue(settings.waitForExistence(timeout: 10))
@@ -86,14 +95,51 @@ final class CornellNoteUITests: XCTestCase {
         XCTAssertEqual(notes.count, 0, "A UI test must start from its own empty store")
 
         app.buttons["新規ノート"].tap()
-        XCTAssertTrue(waitUntil { self.notes.count == 1 }, "The new note must appear in the Library")
-        notes.element(boundBy: 0).tap()
-        XCTAssertTrue(app.buttons["取り消す"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.buttons["取り消す"].waitForExistence(timeout: 10), "The new note must open in the Editor")
         XCTAssertEqual(strokeCount, "線 0 本", "The new note must start blank")
     }
 
     override func tearDownWithError() throws {
         XCUIDevice.shared.orientation = .landscapeLeft
+    }
+
+    func testBlankNewNoteIsDeletedOnReturn() {
+        app.buttons["ライブラリ"].tap()
+        XCTAssertTrue(app.staticTexts["ノートはありません"].waitForExistence(timeout: 5))
+        XCTAssertEqual(notes.count, 0)
+    }
+
+    func testWhitespaceOnlyNewNoteIsDeletedOnReturn() {
+        let title = app.textFields["ノートのタイトル"]
+        title.tap()
+        title.typeText("   ")
+        app.buttons["ライブラリ"].tap()
+        XCTAssertTrue(app.staticTexts["ノートはありません"].waitForExistence(timeout: 5))
+        XCTAssertEqual(notes.count, 0)
+    }
+
+    func testNewNoteWithTitleRemainsAndExistingEmptyNoteIsNotDeleted() {
+        let title = app.textFields["ノートのタイトル"]
+        title.tap()
+        title.typeText("Kept title")
+        app.buttons["ライブラリ"].tap()
+        let row = app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Kept title'")).firstMatch
+        XCTAssertTrue(row.waitForExistence(timeout: 5))
+        row.tap()
+        XCTAssertTrue(title.waitForExistence(timeout: 5))
+        title.tap()
+        title.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: "Kept title".count))
+        app.buttons["ライブラリ"].tap()
+        XCTAssertTrue(waitUntil { self.notes.count == 1 })
+    }
+
+    func testNewNoteWithStrokeRemainsOnReturn() {
+        drawLine(y: pageY(0.35))
+        XCTAssertTrue(waitUntil { self.strokeCount == "線 1 本" })
+        app.buttons["ライブラリ"].tap()
+        XCTAssertTrue(waitUntil { self.notes.count == 1 })
+        notes.element(boundBy: 0).tap()
+        XCTAssertTrue(waitUntil { self.strokeCount == "線 1 本" })
     }
 
     func testAppStaysInLandscapeWhenTheDeviceTurnsToPortrait() {
@@ -169,13 +215,33 @@ final class CornellNoteUITests: XCTestCase {
 
     func testDrawingIsSavedAndTitleTypingKeepsFocus() {
         drawLine(y: pageY(0.52))
-        XCTAssertTrue(waitUntil(timeout: 10) { self.app.staticTexts["Saved"].exists && !self.app.buttons["保存"].isEnabled },
-                      "The stroke must be autosaved")
+        XCTAssertTrue(waitUntil(timeout: 10) { !self.app.buttons["保存"].isEnabled }, "The stroke must be autosaved")
+        XCTAssertFalse(app.staticTexts["Saved"].exists)
+        app.buttons["ライブラリ"].tap()
+        XCTAssertTrue(waitUntil { self.notes.count == 1 })
+        notes.element(boundBy: 0).tap()
+        XCTAssertTrue(waitUntil { self.strokeCount == "線 1 本" }, "The autosaved stroke must survive reopening")
 
         let title = app.textFields["ノートのタイトル"]
         title.tap()
         title.typeText("Tools")
         XCTAssertEqual(title.value as? String, "Tools", "The canvas must not take focus from the title field")
+    }
+
+    func testCanvasTapRestoresToolPickerAfterTitleInput() {
+        let palette = app.otherElements["Drawing-Palette"]
+        XCTAssertTrue(palette.waitForExistence(timeout: 10))
+        let title = app.textFields["ノートのタイトル"]
+        title.tap()
+        title.typeText("Title")
+        XCTAssertEqual(title.value as? String, "Title")
+        XCTAssertTrue(waitUntil { !palette.isHittable }, "The picker must leave when the title has focus")
+        canvas.coordinate(withNormalizedOffset: CGVector(dx: 0.7, dy: 0.5)).tap()
+        XCTAssertTrue(waitUntil { palette.isHittable }, "The picker must return after tapping the canvas")
+        // The focusing tap may itself leave a dot, so only require the drag to add a stroke.
+        let strokesAfterTap = strokeCount
+        drawLine(y: pageY(0.6))
+        XCTAssertTrue(waitUntil { self.strokeCount != strokesAfterTap }, "Drawing must work after the picker returns")
     }
 
     func testSelectedWeightAppliesToTheNextStroke() {
