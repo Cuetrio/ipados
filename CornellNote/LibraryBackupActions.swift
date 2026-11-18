@@ -12,7 +12,7 @@ struct LibraryBackupActions: ViewModifier {
     let saveState: NoteSaveState
     let lastSaved: Date?
     @Binding var restoreState: RestoreState?
-    @State private var isSettingsPresented = false
+    @Binding var isSettingsPresented: Bool
     @State private var isConfirmingRestore = false
     @State private var capacity: Int64?
     @State private var isImportingBackup = false
@@ -37,11 +37,11 @@ struct LibraryBackupActions: ViewModifier {
                         Section("保存") {
                             LabeledContent("保存状態", value: saveState.label)
                             LabeledContent("現存ノートの最新更新日時") {
-                                Text(lastSaved.map { $0.formatted(date: .abbreviated, time: .shortened) } ?? "確認できません")
+                                Text(lastSaved.map { LibraryView.japaneseDate($0, includeTime: true) } ?? "確認できません")
                             }
                             .accessibilityElement(children: .ignore)
                             .accessibilityLabel("現存ノートの最新更新日時")
-                            .accessibilityValue(lastSaved.map { $0.formatted(date: .abbreviated, time: .shortened) } ?? "確認できません")
+                            .accessibilityValue(lastSaved.map { LibraryView.japaneseDate($0, includeTime: true) } ?? "確認できません")
                             .accessibilityIdentifier("latestNoteUpdateDate")
                             Text("ノートの作成・編集日時です。復元したノートはバックアップ内の日時で、削除やバックアップ操作の日時は含みません。")
                             LabeledContent("利用可能容量", value: Self.capacityLabel(capacity))
@@ -176,12 +176,23 @@ struct LibraryBackupActions: ViewModifier {
         }
     }
 
+    static func readSecurityScopedData(
+        at url: URL,
+        startAccessing: (URL) -> Bool = { $0.startAccessingSecurityScopedResource() },
+        stopAccessing: (URL) -> Void = { $0.stopAccessingSecurityScopedResource() },
+        read: (URL) throws -> Data = { try Data(contentsOf: $0) }
+    ) throws -> Data {
+        let didStartAccessing = startAccessing(url)
+        defer { if didStartAccessing { stopAccessing(url) } }
+        return try read(url)
+    }
+
     private func exportCompleted(_ result: Result<URL, Error>) {
         switch result {
         case .failure(let error):
             transferError = Self.exportFailureMessage(error.localizedDescription)
         case .success(let url):
-            guard let data = try? Data(contentsOf: url),
+            guard let data = try? Self.readSecurityScopedData(at: url),
                   data == backupDocument.data,
                   data.backupSHA256Hex == backupDocument.data.backupSHA256Hex else {
                 transferError = Self.exportFailureMessage("書き出し先のバックアップを検証できませんでした。")

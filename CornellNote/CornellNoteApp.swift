@@ -12,10 +12,16 @@ struct CornellNoteApp: App {
     }
 }
 
+@Observable
+final class BackupPresentationState {
+    var isSettingsPresented = false
+}
+
 @MainActor
 private struct CornellNoteRootView: View {
     let startup: NoteStartupController
     @State private var restoreState: RestoreState?
+    @State private var backupPresentation = BackupPresentationState()
 
     var body: some View {
         Group {
@@ -23,7 +29,7 @@ private struct CornellNoteRootView: View {
             case .checking:
                 ProgressView("保存領域を確認中")
             case .ready(let generation):
-                LibraryView(restoreState: $restoreState, fileSystem: generation.fileSystem, writeAdmission: generation.writeAdmission, startup: startup)
+                LibraryView(restoreState: $restoreState, isSettingsPresented: $backupPresentation.isSettingsPresented, fileSystem: generation.fileSystem, writeAdmission: generation.writeAdmission, startup: startup)
                     .modelContainer(generation.container)
                     .id(ObjectIdentifier(generation.container))
             case .blocked(let failure):

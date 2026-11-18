@@ -2,6 +2,7 @@ import Foundation
 import CryptoKit
 import PencilKit
 import SwiftData
+import SwiftUI
 import XCTest
 @testable import CornellNote
 
@@ -29,6 +30,57 @@ private enum MissingRequiredAttributeSchema {
 @MainActor
 final class CornellNoteTests: XCTestCase {
     private static let fixtureRunID = UUID().uuidString.lowercased()
+
+    func testSecondFingerCancelsAndBlocksUntilAllFingersEnd() {
+        var gate = SecondFingerGate()
+        XCTAssertEqual(gate.update(directTouches: 1, pencilTouches: 0), .none)
+        XCTAssertEqual(gate.update(directTouches: 2, pencilTouches: 0), .disableDrawing)
+        XCTAssertEqual(gate.update(directTouches: 1, pencilTouches: 0), .none)
+        XCTAssertTrue(gate.isBlocked)
+        XCTAssertEqual(gate.update(directTouches: 2, pencilTouches: 0), .none)
+        XCTAssertEqual(gate.update(directTouches: 0, pencilTouches: 0), .enableDrawing)
+        XCTAssertFalse(gate.isBlocked)
+        XCTAssertEqual(gate.update(directTouches: 1, pencilTouches: 0), .none)
+    }
+
+    func testSecondFingerGateLeavesPencilAndSingleFingerAlone() {
+        var gate = SecondFingerGate()
+        XCTAssertEqual(gate.update(directTouches: 0, pencilTouches: 1), .none)
+        XCTAssertEqual(gate.update(directTouches: 2, pencilTouches: 1), .none)
+        XCTAssertFalse(gate.isBlocked)
+        XCTAssertEqual(gate.update(directTouches: 1, pencilTouches: 1), .none)
+        XCTAssertEqual(gate.update(directTouches: 0, pencilTouches: 0), .none)
+        XCTAssertEqual(gate.update(directTouches: 1, pencilTouches: 0), .none)
+        XCTAssertEqual(gate.update(directTouches: 0, pencilTouches: 0), .none)
+    }
+
+    func testSecondFingerGateWaitsForPencilAndHandlesSimultaneousTouches() {
+        var gate = SecondFingerGate()
+        XCTAssertEqual(gate.update(directTouches: 2, pencilTouches: 0), .disableDrawing)
+        XCTAssertEqual(gate.update(directTouches: 0, pencilTouches: 1), .none)
+        XCTAssertTrue(gate.isBlocked)
+        XCTAssertEqual(gate.update(directTouches: 0, pencilTouches: 0), .enableDrawing)
+        XCTAssertEqual(gate.update(directTouches: 2, pencilTouches: 1), .none)
+        XCTAssertEqual(gate.update(directTouches: 2, pencilTouches: 0), .disableDrawing)
+        XCTAssertEqual(gate.update(directTouches: 0, pencilTouches: 0), .enableDrawing)
+    }
+
+    func testDrawingFocusIsRestoredOnlyWhenEditableAndNotFirstResponder() {
+        XCTAssertTrue(NoteCanvasView.shouldRestoreDrawingFocus(isEditable: true, isFirstResponder: false))
+        XCTAssertFalse(NoteCanvasView.shouldRestoreDrawingFocus(isEditable: true, isFirstResponder: true))
+        XCTAssertFalse(NoteCanvasView.shouldRestoreDrawingFocus(isEditable: false, isFirstResponder: false))
+        XCTAssertFalse(NoteCanvasView.shouldRestoreDrawingFocus(isEditable: false, isFirstResponder: true))
+    }
+
+    func testEditorStatusLabelShowsOnlyFailures() {
+        for state in [NoteSaveState.saved, .saving, .unsavedChanges] {
+            XCTAssertNil(EditorView.statusLabel(saveState: state, hasLoadFailure: false))
+        }
+        XCTAssertEqual(EditorView.statusLabel(saveState: .saveFailed, hasLoadFailure: false), "Save failed")
+        for state in [NoteSaveState.saved, .saving, .unsavedChanges, .saveFailed] {
+            XCTAssertEqual(EditorView.statusLabel(saveState: state, hasLoadFailure: true), "Read failed")
+        }
+    }
 
     func testMetadataStoreMissingRequiredAttributeIsRejectedAndPreserved() throws {
         try assertIncompatibleMetadataStoreIsRejected(MissingRequiredAttributeSchema.NoteRecord()) { note in
@@ -213,6 +265,16 @@ final class CornellNoteTests: XCTestCase {
             XCTAssertTrue(LibraryView.performDelete { try controller.delete(note: note) })
             XCTAssertEqual(fileSystem.removalAttempts, paths)
             XCTAssertTrue(try context.fetch(FetchDescriptor<NoteRecord>()).isEmpty)
+        }
+    }
+
+    func testLibraryAndBackupDatesUseJapaneseFormat() {
+        let date = Date(timeIntervalSince1970: 1_795_003_200)
+        for includeTime in [false, true] {
+            let formatted = LibraryView.japaneseDate(date, includeTime: includeTime)
+            XCTAssertTrue(formatted.contains("年"), formatted)
+            XCTAssertTrue(formatted.contains("月"), formatted)
+            XCTAssertTrue(formatted.contains("日"), formatted)
         }
     }
 
@@ -1178,6 +1240,64 @@ final class CornellNoteTests: XCTestCase {
         for (index, failure) in failures.enumerated() {
             provider.failure = failure
             XCTAssertThrowsError(try coordinator.export(to: root.appendingPathComponent("provider-failure-\(index).backup")))
+        }
+    }
+
+    func testExportReadBalancesSecurityScopeOnSuccessAndFailure() throws {
+        enum ReadError: Error { case failed }
+        let url = URL(fileURLWithPath: "/backup")
+        for started in [true, false] {
+            for fails in [true, false] {
+                var events: [String] = []
+                let read = {
+                    try LibraryBackupActions.readSecurityScopedData(at: url, startAccessing: { received in
+                        XCTAssertEqual(received, url)
+                        events.append("start")
+                        return started
+                    }, stopAccessing: { received in
+                        XCTAssertEqual(received, url)
+                        events.append("stop")
+                    }, read: { received in
+                        XCTAssertEqual(received, url)
+                        events.append("read")
+                        if fails { throw ReadError.failed }
+                        return Data([1, 2, 3])
+                    })
+                }
+                if fails {
+                    XCTAssertThrowsError(try read())
+                } else {
+                    XCTAssertEqual(try read(), Data([1, 2, 3]))
+                }
+                XCTAssertEqual(events, started ? ["start", "read", "stop"] : ["start", "read"])
+            }
+        }
+    }
+
+    func testSettingsPresentationSurvivesRestoreContainerReplacement() throws {
+        for succeeds in [false, true] {
+            let root = try makeTemporaryDirectory()
+            defer { try? removeTemporaryDirectory(at: root) }
+            let startup = NoteStartupController(fileSystem: LocalNoteFileSystem(rootURL: root))
+            startup.recheck()
+            guard case .ready(let original) = startup.state else { return XCTFail("Store did not open") }
+            let presentation = BackupPresentationState()
+            let binding = Binding(get: { presentation.isSettingsPresented }, set: { presentation.isSettingsPresented = $0 })
+            let originalView = LibraryView(restoreState: .constant(nil), isSettingsPresented: binding,
+                fileSystem: original.fileSystem, writeAdmission: original.writeAdmission, startup: startup)
+            originalView.isSettingsPresented = true
+
+            let data = succeeds ? try makeSimpleBackupData(title: "Imported") : Data([0, 1, 2])
+            let result = BackupRestoreCoordinator(modelContext: ModelContext(original.container),
+                fileSystem: original.fileSystem, startup: startup).restore(from: data)
+            XCTAssertEqual(result.state, succeeds ? .completed : .restoreFailed)
+            guard case .ready(let reopened) = startup.state else { return XCTFail("Store did not reopen") }
+            XCTAssertFalse(original.container === reopened.container)
+            let reopenedView = LibraryView(restoreState: .constant(result.state), isSettingsPresented: binding,
+                fileSystem: reopened.fileSystem, writeAdmission: reopened.writeAdmission, startup: startup)
+            XCTAssertTrue(reopenedView.isSettingsPresented)
+            reopenedView.isSettingsPresented = false
+            XCTAssertFalse(presentation.isSettingsPresented)
         }
     }
 
