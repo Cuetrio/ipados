@@ -58,6 +58,7 @@ final class NoteCanvasView: PKCanvasView, UIGestureRecognizerDelegate {
     private let drawingHistory = UndoManager()
     private let backgroundView = CornellBackgroundView()
     private var secondFingerGate = SecondFingerGate()
+    var onStrokeCancelled: (() -> Void)?
 
     override var undoManager: UndoManager? { drawingHistory }
 
@@ -85,7 +86,7 @@ final class NoteCanvasView: PKCanvasView, UIGestureRecognizerDelegate {
             guard let self else { return }
             switch self.secondFingerGate.update(directTouches: direct, pencilTouches: pencil) {
             case .disableDrawing:
-                self.drawingGestureRecognizer.isEnabled = false
+                self.cancelInProgressStroke()
             case .enableDrawing:
                 self.drawingGestureRecognizer.isEnabled = true
             case .none:
@@ -93,6 +94,11 @@ final class NoteCanvasView: PKCanvasView, UIGestureRecognizerDelegate {
             }
         }
         addGestureRecognizer(observer)
+    }
+
+    func cancelInProgressStroke() {
+        drawingGestureRecognizer.isEnabled = false
+        onStrokeCancelled?()
     }
 
     private func installFocusTap() {
@@ -157,6 +163,7 @@ struct CanvasView: UIViewRepresentable {
         canvasView.minimumZoomScale = 1
         canvasView.maximumZoomScale = 4
         canvasView.delegate = context.coordinator
+        context.coordinator.observeCancellation(of: canvasView)
         canvasView.accessibilityIdentifier = "note-canvas"
         canvasView.accessibilityLabel = "手書き"
         Coordinator.describeStrokes(of: canvasView)
@@ -188,6 +195,7 @@ struct CanvasView: UIViewRepresentable {
     static func dismantleUIView(_ uiView: NoteCanvasView, coordinator: Coordinator) {
         coordinator.toolPicker.setVisible(false, forFirstResponder: uiView)
         coordinator.toolPicker.removeObserver(uiView)
+        uiView.onStrokeCancelled = nil
         uiView.resignFirstResponder()
     }
 
@@ -201,6 +209,13 @@ struct CanvasView: UIViewRepresentable {
         init(onDrawingChanged: @escaping (PKDrawing) -> Void, onStrokeChanged: @escaping (Bool) -> Void) {
             self.onDrawingChanged = onDrawingChanged
             self.onStrokeChanged = onStrokeChanged
+        }
+
+        func observeCancellation(of canvasView: NoteCanvasView) {
+            canvasView.onStrokeCancelled = { [weak self, weak canvasView] in
+                guard let self, let canvasView else { return }
+                self.canvasViewDidEndUsingTool(canvasView)
+            }
         }
 
         func canvasViewDidBeginUsingTool(_ canvasView: PKCanvasView) {

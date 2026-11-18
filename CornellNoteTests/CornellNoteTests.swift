@@ -65,6 +65,67 @@ final class CornellNoteTests: XCTestCase {
         XCTAssertEqual(gate.update(directTouches: 0, pencilTouches: 0), .enableDrawing)
     }
 
+    func testCancellingStrokeDisablesDrawingAndNotifiesCoordinator() throws {
+        let canvas = NoteCanvasView()
+        let committed = nonemptyDrawing(offset: 0)
+        canvas.drawing = committed
+        var strokeChanges: [Bool] = []
+        var drawings: [PKDrawing] = []
+        let coordinator = CanvasView.Coordinator(onDrawingChanged: { drawings.append($0) }, onStrokeChanged: {
+            strokeChanges.append($0)
+        })
+        coordinator.observeCancellation(of: canvas)
+
+        canvas.cancelInProgressStroke()
+
+        XCTAssertFalse(canvas.drawingGestureRecognizer.isEnabled)
+        XCTAssertEqual(strokeChanges, [false])
+        XCTAssertEqual(drawings.count, 1)
+        XCTAssertFalse(NoteEditingSession.differs(try XCTUnwrap(drawings.first), from: committed))
+    }
+
+    func testCancelledStrokeSynchronizesSessionAndDuplicateNotificationsAreIdempotent() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? removeTemporaryDirectory(at: root) }
+        let fileSystem = LocalNoteFileSystem(rootURL: root)
+        let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
+        let context = ModelContext(container)
+        let persistence = NotePersistenceController(modelContext: context, fileSystem: fileSystem)
+        let note = NoteRecord(title: "Cancellation")
+        context.insert(note)
+        try context.save()
+        let committed = nonemptyDrawing(offset: 0)
+        try persistence.save(note: note, drawing: committed)
+        let session = NoteEditingSession(note: note, persistence: persistence)
+        let canvas = NoteCanvasView()
+        canvas.drawing = committed
+        let coordinator = CanvasView.Coordinator(onDrawingChanged: { session.updateDrawing($0) }, onStrokeChanged: {
+            session.setDrawingStrokeInProgress($0)
+        })
+        coordinator.observeCancellation(of: canvas)
+
+        var draft = committed
+        draft.strokes.append(contentsOf: nonemptyDrawing(offset: 100).strokes)
+        session.updateDrawing(draft)
+        session.setDrawingStrokeInProgress(true)
+        canvas.cancelInProgressStroke()
+
+        XCTAssertFalse(canvas.drawingGestureRecognizer.isEnabled)
+        XCTAssertFalse(session.isDrawingStrokeInProgress)
+        XCTAssertEqual(session.drawingDraft.strokes.count, 1)
+        XCTAssertFalse(NoteEditingSession.differs(session.drawingDraft, from: committed))
+        session.flushSave()
+        XCTAssertFalse(session.hasUnsavedChanges)
+
+        coordinator.canvasViewDrawingDidChange(canvas)
+        coordinator.canvasViewDidEndUsingTool(canvas)
+        canvas.cancelInProgressStroke()
+        XCTAssertFalse(session.isDrawingStrokeInProgress)
+        XCTAssertFalse(NoteEditingSession.differs(session.drawingDraft, from: committed))
+        XCTAssertFalse(session.hasUnsavedChanges)
+        XCTAssertEqual(session.saveState, .saved)
+    }
+
     func testDrawingFocusIsRestoredOnlyWhenEditableAndNotFirstResponder() {
         XCTAssertTrue(NoteCanvasView.shouldRestoreDrawingFocus(isEditable: true, isFirstResponder: false))
         XCTAssertFalse(NoteCanvasView.shouldRestoreDrawingFocus(isEditable: true, isFirstResponder: true))
