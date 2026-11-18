@@ -48,7 +48,7 @@ python3 -I -m unittest discover -s scripts -p test_unit_test_fixtures.py -v
 The product specification source of truth is the private `Cornell-Note/product` repository:
 
 - Exact specification path: `doc/ipados/requirements/IPADOS_HANDWRITING_APP_SPEC.md`
-- Approved product commit: `4c8dde0b8fc65a40668807b81f8316f699fe0103`
+- Approved product commit: `f1628c82b3cafa00661960fdc20383dc81a1cea9`
 
 The revision pin is defined by four fields: path, commit SHA, change/impact, and verification. The pinned path is read from the approved commit; the change/impact is the iPadOS reference-only boundary; verification requires the commit and path to be available as Git objects.
 
