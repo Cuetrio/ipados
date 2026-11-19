@@ -89,7 +89,6 @@ struct LibraryView: View {
             .onChange(of: scenePhase) { _, phase in
                 if phase == .background && !isEditorPresented { editingSession?.flushSave() }
             }
-            .navigationTitle("Cuetrio")
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button(action: createNote) {

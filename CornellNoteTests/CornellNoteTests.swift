@@ -31,6 +31,35 @@ private enum MissingRequiredAttributeSchema {
 final class CornellNoteTests: XCTestCase {
     private static let fixtureRunID = UUID().uuidString.lowercased()
 
+    func testReviewStateRevealsIndependentlyAndResetsOnReentry() {
+        var review = ReviewState()
+        XCTAssertFalse(review.isActive)
+        review.begin()
+        XCTAssertTrue(review.isActive)
+        XCTAssertTrue(review.notesCovered)
+        XCTAssertTrue(review.summaryCovered)
+        review.revealNotes()
+        XCTAssertFalse(review.notesCovered)
+        XCTAssertTrue(review.summaryCovered)
+        review.revealSummary()
+        XCTAssertFalse(review.summaryCovered)
+        review.end()
+        XCTAssertFalse(review.isActive)
+        review.begin()
+        XCTAssertTrue(review.notesCovered)
+        XCTAssertTrue(review.summaryCovered)
+    }
+
+    func testCornellRegionsMatchBackgroundBoundaries() {
+        for size in [CGSize(width: 800, height: 500), CGSize(width: 1200, height: 600)] {
+            let regions = CornellRegions(size: size)
+            let left = min(size.width * 0.28, 260)
+            let top = size.height * 0.78
+            XCTAssertEqual(regions.notes, CGRect(x: left, y: 0, width: size.width - left, height: top))
+            XCTAssertEqual(regions.summary, CGRect(x: 0, y: top, width: size.width, height: size.height - top))
+        }
+    }
+
     func testSecondFingerCancelsAndBlocksUntilAllFingersEnd() {
         var gate = SecondFingerGate()
         XCTAssertEqual(gate.update(directTouches: 1, pencilTouches: 0), .none)
@@ -665,6 +694,17 @@ final class CornellNoteTests: XCTestCase {
         XCTAssertNotNil(try controller.thumbnailData(for: note))
         XCTAssertEqual(try controller.loadDrawing(for: note).bounds, nonemptyDrawing(offset: 0).bounds)
         XCTAssertEqual(session.drawingDraft.bounds, nonemptyDrawing(offset: 200).bounds)
+        let draft = session.drawingDraft.dataRepresentation()
+        let metadata = BackupMetadata(noteRecords: [note])
+        var review = ReviewState()
+        review.begin()
+        review.revealNotes()
+        review.revealSummary()
+        review.end()
+        XCTAssertEqual(session.saveState, .saveFailed)
+        XCTAssertTrue(session.hasUnsavedChanges)
+        XCTAssertEqual(session.drawingDraft.dataRepresentation(), draft)
+        XCTAssertEqual(BackupMetadata(noteRecords: [note]), metadata)
     }
 
     func testBackupEnvelopeHasDeterministicCanonicalGoldenBytes() throws {

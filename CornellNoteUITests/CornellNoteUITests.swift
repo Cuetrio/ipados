@@ -103,6 +103,35 @@ final class CornellNoteUITests: XCTestCase {
         XCUIDevice.shared.orientation = .landscapeLeft
     }
 
+    func testReviewCoversAndDisablesDrawingUntilEditingResumes() {
+        drawLine(y: pageY(0.35))
+        XCTAssertTrue(waitUntil { self.strokeCount == "線 1 本" })
+        let reviewStart = point(lineStartX, pageY(0.45))
+        let reviewEnd = point(lineEndX, pageY(0.45))
+        app.buttons["復習"].tap()
+        let notesCover = app.buttons["review-notes-cover"]
+        let summaryCover = app.buttons["review-summary-cover"]
+        XCTAssertTrue(notesCover.waitForExistence(timeout: 5))
+        XCTAssertTrue(summaryCover.exists)
+        XCTAssertFalse(app.buttons["取り消す"].isEnabled)
+        XCTAssertFalse(app.buttons["やり直す"].isEnabled)
+        XCTAssertFalse(app.textFields["ノートのタイトル"].isEnabled)
+        XCTAssertTrue(waitUntil { !self.app.otherElements["Drawing-Palette"].isHittable })
+        notesCover.tap()
+        XCTAssertFalse(notesCover.exists)
+        XCTAssertTrue(summaryCover.exists)
+        drag(from: reviewStart, to: reviewEnd)
+        summaryCover.tap()
+        XCTAssertFalse(summaryCover.exists)
+        app.buttons["復習を終える"].tap()
+        XCTAssertTrue(waitUntil { self.strokeCount == "線 1 本" })
+        drawLine(y: pageY(0.55))
+        XCTAssertTrue(waitUntil { self.strokeCount == "線 2 本" })
+        app.buttons["復習"].tap()
+        XCTAssertTrue(notesCover.waitForExistence(timeout: 5))
+        XCTAssertTrue(summaryCover.exists)
+    }
+
     func testBlankNewNoteIsDeletedOnReturn() {
         app.buttons["ライブラリ"].tap()
         XCTAssertTrue(app.staticTexts["ノートはありません"].waitForExistence(timeout: 5))

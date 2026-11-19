@@ -58,6 +58,11 @@ final class NoteCanvasView: PKCanvasView, UIGestureRecognizerDelegate {
     private let drawingHistory = UndoManager()
     private let backgroundView = CornellBackgroundView()
     private var secondFingerGate = SecondFingerGate()
+    private let notesCover = UIButton(type: .system)
+    private let summaryCover = UIButton(type: .system)
+    private var editingEnabled = true
+    var onRevealNotes: (() -> Void)?
+    var onRevealSummary: (() -> Void)?
     var onStrokeCancelled: (() -> Void)?
 
     override var undoManager: UndoManager? { drawingHistory }
@@ -67,6 +72,7 @@ final class NoteCanvasView: PKCanvasView, UIGestureRecognizerDelegate {
         insertSubview(backgroundView, at: 0)
         installFocusTap()
         installTouchObserver()
+        installReviewCovers()
     }
 
     required init?(coder: NSCoder) {
@@ -74,6 +80,47 @@ final class NoteCanvasView: PKCanvasView, UIGestureRecognizerDelegate {
         insertSubview(backgroundView, at: 0)
         installFocusTap()
         installTouchObserver()
+        installReviewCovers()
+    }
+
+    private func installReviewCovers() {
+        for (button, label, identifier) in [
+            (notesCover, "ノートをタップして表示", "review-notes-cover"),
+            (summaryCover, "まとめをタップして表示", "review-summary-cover")
+        ] {
+            button.backgroundColor = .secondarySystemBackground
+            button.setTitle(label, for: .normal)
+            button.titleLabel?.font = .preferredFont(forTextStyle: .body)
+            button.titleLabel?.adjustsFontForContentSizeCategory = true
+            button.accessibilityIdentifier = identifier
+            button.isHidden = true
+            addSubview(button)
+        }
+        notesCover.addAction(UIAction { [weak self] _ in self?.onRevealNotes?() }, for: .touchUpInside)
+        summaryCover.addAction(UIAction { [weak self] _ in self?.onRevealSummary?() }, for: .touchUpInside)
+    }
+
+    func applyReview(_ review: ReviewState, isEditable: Bool) {
+        editingEnabled = isEditable
+        isUserInteractionEnabled = isEditable || review.isActive
+        drawingGestureRecognizer.isEnabled = isEditable && !secondFingerGate.isBlocked
+        notesCover.isHidden = !review.isActive || !review.notesCovered
+        summaryCover.isHidden = !review.isActive || !review.summaryCovered
+        isReviewActive = review.isActive
+        setNeedsLayout()
+    }
+
+    private var isReviewActive = false
+
+    // PencilKit supplies its own accessibility children, so expose the open covers instead while reviewing.
+    override var isAccessibilityElement: Bool {
+        get { isReviewActive ? false : super.isAccessibilityElement }
+        set { super.isAccessibilityElement = newValue }
+    }
+
+    override var accessibilityElements: [Any]? {
+        get { isReviewActive ? [notesCover, summaryCover].filter { !$0.isHidden } : super.accessibilityElements }
+        set { super.accessibilityElements = newValue }
     }
 
     private func installTouchObserver() {
@@ -86,9 +133,9 @@ final class NoteCanvasView: PKCanvasView, UIGestureRecognizerDelegate {
             guard let self else { return }
             switch self.secondFingerGate.update(directTouches: direct, pencilTouches: pencil) {
             case .disableDrawing:
-                self.cancelInProgressStroke()
+                if self.editingEnabled { self.cancelInProgressStroke() }
             case .enableDrawing:
-                self.drawingGestureRecognizer.isEnabled = true
+                self.drawingGestureRecognizer.isEnabled = self.editingEnabled
             case .none:
                 break
             }
@@ -113,7 +160,7 @@ final class NoteCanvasView: PKCanvasView, UIGestureRecognizerDelegate {
     }
 
     func restoreDrawingFocus() {
-        if Self.shouldRestoreDrawingFocus(isEditable: isUserInteractionEnabled, isFirstResponder: isFirstResponder) {
+        if Self.shouldRestoreDrawingFocus(isEditable: editingEnabled && isUserInteractionEnabled, isFirstResponder: isFirstResponder) {
             becomeFirstResponder()
         }
     }
@@ -136,12 +183,23 @@ final class NoteCanvasView: PKCanvasView, UIGestureRecognizerDelegate {
         backgroundView.center = CGPoint(x: pageSize.width * zoomScale / 2, y: pageSize.height * zoomScale / 2)
         backgroundView.transform = CGAffineTransform(scaleX: zoomScale, y: zoomScale)
         sendSubviewToBack(backgroundView)
+        let regions = CornellRegions(size: pageSize)
+        for (cover, rect) in [(notesCover, regions.notes), (summaryCover, regions.summary)] {
+            cover.transform = .identity
+            cover.bounds = CGRect(origin: .zero, size: rect.size)
+            cover.center = CGPoint(x: rect.midX * zoomScale, y: rect.midY * zoomScale)
+            cover.transform = CGAffineTransform(scaleX: zoomScale, y: zoomScale)
+            bringSubviewToFront(cover)
+        }
     }
 }
 
 struct CanvasView: UIViewRepresentable {
     let canvasView: NoteCanvasView
     var isEditable = true
+    var review = ReviewState()
+    var onRevealNotes: () -> Void = {}
+    var onRevealSummary: () -> Void = {}
     var onDrawingChanged: (PKDrawing) -> Void = { _ in }
     var onStrokeChanged: (Bool) -> Void = { _ in }
 
@@ -177,7 +235,9 @@ struct CanvasView: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: NoteCanvasView, context: Context) {
-        uiView.isUserInteractionEnabled = isEditable
+        uiView.onRevealNotes = onRevealNotes
+        uiView.onRevealSummary = onRevealSummary
+        uiView.applyReview(review, isEditable: isEditable)
         context.coordinator.toolPicker.setVisible(isEditable, forFirstResponder: uiView)
         // Change first responder only when editability changes, so title typing keeps its focus.
         guard context.coordinator.appliedEditable != isEditable else { return }

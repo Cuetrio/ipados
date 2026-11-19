@@ -1,6 +1,22 @@
 import PencilKit
 import SwiftUI
 
+struct ReviewState {
+    private(set) var isActive = false
+    private(set) var notesCovered = false
+    private(set) var summaryCovered = false
+
+    mutating func begin() {
+        isActive = true
+        notesCovered = true
+        summaryCovered = true
+    }
+
+    mutating func end() { isActive = false }
+    mutating func revealNotes() { notesCovered = false }
+    mutating func revealSummary() { summaryCovered = false }
+}
+
 struct EditorView: View {
     @Environment(\.scenePhase) private var scenePhase
     let session: NoteEditingSession
@@ -9,6 +25,9 @@ struct EditorView: View {
     @State private var isShowingLeaveWarning = false
     @State private var canUndo = false
     @State private var canRedo = false
+    @State private var review = ReviewState()
+
+    private var isEditable: Bool { session.canEdit && !review.isActive }
 
     static func statusLabel(saveState: NoteSaveState, hasLoadFailure: Bool) -> String? {
         if hasLoadFailure { return "Read failed" }
@@ -23,7 +42,7 @@ struct EditorView: View {
             ))
                 .textFieldStyle(.roundedBorder)
                 .padding()
-                .disabled(!session.canEdit)
+                .disabled(!isEditable)
 
             if let message = session.loadFailureMessage {
                 ContentUnavailableView {
@@ -54,7 +73,9 @@ struct EditorView: View {
 
                 GeometryReader { proxy in
                     // The canvas draws the Cornell background itself so it zooms with the ink.
-                    CanvasView(canvasView: canvasView, isEditable: session.canEdit, onDrawingChanged: { drawing in
+                    CanvasView(canvasView: canvasView, isEditable: isEditable, review: review,
+                               onRevealNotes: { review.revealNotes() },
+                               onRevealSummary: { review.revealSummary() }, onDrawingChanged: { drawing in
                         session.updateDrawing(drawing)
                         refreshHistoryState()
                     }, onStrokeChanged: { session.setDrawingStrokeInProgress($0) })
@@ -78,16 +99,20 @@ struct EditorView: View {
                 } label: {
                     Label("取り消す", systemImage: "arrow.uturn.backward")
                 }
-                .disabled(!session.canEdit || !canUndo)
+                .disabled(!isEditable || !canUndo)
                 Button {
                     canvasView.undoManager?.redo()
                     refreshHistoryState()
                 } label: {
                     Label("やり直す", systemImage: "arrow.uturn.forward")
                 }
-                .disabled(!session.canEdit || !canRedo)
+                .disabled(!isEditable || !canRedo)
             }
             ToolbarItemGroup(placement: .topBarTrailing) {
+                Button(review.isActive ? "復習を終える" : "復習") {
+                    if review.isActive { review.end() } else { review.begin() }
+                }
+                .disabled(session.loadFailureMessage != nil)
                 Button("保存") { session.flushSave() }
                     .disabled(!session.canEdit || !session.hasUnsavedChanges)
                 if let label = Self.statusLabel(saveState: session.saveState, hasLoadFailure: session.loadFailureMessage != nil) {
