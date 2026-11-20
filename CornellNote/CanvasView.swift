@@ -101,9 +101,14 @@ final class NoteCanvasView: PKCanvasView, UIGestureRecognizerDelegate {
     }
 
     func applyReview(_ review: ReviewState, isEditable: Bool) {
+        let shouldCancelStroke = editingEnabled && !isEditable
         editingEnabled = isEditable
         isUserInteractionEnabled = isEditable || review.isActive
-        drawingGestureRecognizer.isEnabled = isEditable && !secondFingerGate.isBlocked
+        if shouldCancelStroke {
+            cancelInProgressStroke()
+        } else {
+            drawingGestureRecognizer.isEnabled = isEditable && !secondFingerGate.isBlocked
+        }
         notesCover.isHidden = !review.isActive || !review.notesCovered
         summaryCover.isHidden = !review.isActive || !review.summaryCovered
         isReviewActive = review.isActive
