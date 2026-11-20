@@ -31,6 +31,35 @@ private enum MissingRequiredAttributeSchema {
 final class CornellNoteTests: XCTestCase {
     private static let fixtureRunID = UUID().uuidString.lowercased()
 
+    func testReviewStateRevealsIndependentlyAndResetsOnReentry() {
+        var review = ReviewState()
+        XCTAssertFalse(review.isActive)
+        review.begin()
+        XCTAssertTrue(review.isActive)
+        XCTAssertTrue(review.notesCovered)
+        XCTAssertTrue(review.summaryCovered)
+        review.revealNotes()
+        XCTAssertFalse(review.notesCovered)
+        XCTAssertTrue(review.summaryCovered)
+        review.revealSummary()
+        XCTAssertFalse(review.summaryCovered)
+        review.end()
+        XCTAssertFalse(review.isActive)
+        review.begin()
+        XCTAssertTrue(review.notesCovered)
+        XCTAssertTrue(review.summaryCovered)
+    }
+
+    func testCornellRegionsMatchBackgroundBoundaries() {
+        for size in [CGSize(width: 800, height: 500), CGSize(width: 1200, height: 600)] {
+            let regions = CornellRegions(size: size)
+            let left = min(size.width * 0.28, 260)
+            let top = size.height * 0.78
+            XCTAssertEqual(regions.notes, CGRect(x: left, y: 0, width: size.width - left, height: top))
+            XCTAssertEqual(regions.summary, CGRect(x: 0, y: top, width: size.width, height: size.height - top))
+        }
+    }
+
     func testSecondFingerCancelsAndBlocksUntilAllFingersEnd() {
         var gate = SecondFingerGate()
         XCTAssertEqual(gate.update(directTouches: 1, pencilTouches: 0), .none)
@@ -124,6 +153,79 @@ final class CornellNoteTests: XCTestCase {
         XCTAssertFalse(NoteEditingSession.differs(session.drawingDraft, from: committed))
         XCTAssertFalse(session.hasUnsavedChanges)
         XCTAssertEqual(session.saveState, .saved)
+    }
+
+    func testApplyReviewCancelsOnlyWhenEditingBecomesDisabled() {
+        let canvas = NoteCanvasView()
+        var strokeChanges: [Bool] = []
+        let coordinator = CanvasView.Coordinator(onDrawingChanged: { _ in }, onStrokeChanged: {
+            strokeChanges.append($0)
+        })
+        coordinator.observeCancellation(of: canvas)
+        var review = ReviewState()
+
+        canvas.applyReview(review, isEditable: true)
+        XCTAssertTrue(canvas.drawingGestureRecognizer.isEnabled)
+        XCTAssertTrue(strokeChanges.isEmpty)
+        review.begin()
+        canvas.applyReview(review, isEditable: false)
+        XCTAssertFalse(canvas.drawingGestureRecognizer.isEnabled)
+        XCTAssertEqual(strokeChanges, [false])
+        canvas.applyReview(review, isEditable: false)
+        XCTAssertEqual(strokeChanges, [false])
+        review.end()
+        canvas.applyReview(review, isEditable: true)
+        XCTAssertTrue(canvas.drawingGestureRecognizer.isEnabled)
+        XCTAssertEqual(strokeChanges, [false])
+        canvas.applyReview(review, isEditable: false)
+        XCTAssertFalse(canvas.drawingGestureRecognizer.isEnabled)
+        XCTAssertEqual(strokeChanges, [false, false])
+    }
+
+    func testApplyReviewSynchronizesAndSavesCancelledStroke() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? removeTemporaryDirectory(at: root) }
+        let fileSystem = LocalNoteFileSystem(rootURL: root)
+        let container = try NotePersistenceController.makeContainer(fileSystem: fileSystem)
+        let context = ModelContext(container)
+        let persistence = NotePersistenceController(modelContext: context, fileSystem: fileSystem)
+        let note = NoteRecord(title: "Review cancellation")
+        context.insert(note)
+        try context.save()
+        try persistence.save(note: note, drawing: nonemptyDrawing(offset: 200))
+        let session = NoteEditingSession(note: note, persistence: persistence)
+        let canvas = NoteCanvasView()
+        let committed = nonemptyDrawing(offset: 0)
+        canvas.drawing = committed
+        let coordinator = CanvasView.Coordinator(onDrawingChanged: { session.updateDrawing($0) }, onStrokeChanged: {
+            session.setDrawingStrokeInProgress($0)
+        })
+        coordinator.observeCancellation(of: canvas)
+        var draft = committed
+        draft.strokes.append(contentsOf: nonemptyDrawing(offset: 100).strokes)
+        session.updateDrawing(draft)
+        session.setDrawingStrokeInProgress(true)
+        var review = ReviewState()
+        review.begin()
+
+        canvas.applyReview(review, isEditable: false)
+
+        XCTAssertFalse(session.isDrawingStrokeInProgress)
+        XCTAssertEqual(session.drawingDraft.strokes.count, 1)
+        XCTAssertFalse(NoteEditingSession.differs(session.drawingDraft, from: committed))
+        session.flushSave()
+        XCTAssertEqual(session.saveState, .saved)
+        XCTAssertFalse(session.hasUnsavedChanges)
+        // A saved drawing does not round-trip byte for byte, so compare what the note shows.
+        let saved = try persistence.loadDrawing(for: note)
+        XCTAssertEqual(saved.strokes.count, committed.strokes.count)
+        XCTAssertEqual(saved.bounds, committed.bounds)
+        review.end()
+        canvas.applyReview(review, isEditable: true)
+        canvas.applyReview(review, isEditable: false)
+        XCTAssertFalse(session.isDrawingStrokeInProgress)
+        XCTAssertFalse(NoteEditingSession.differs(session.drawingDraft, from: committed))
+        XCTAssertFalse(session.hasUnsavedChanges)
     }
 
     func testDrawingFocusIsRestoredOnlyWhenEditableAndNotFirstResponder() {
@@ -665,6 +767,17 @@ final class CornellNoteTests: XCTestCase {
         XCTAssertNotNil(try controller.thumbnailData(for: note))
         XCTAssertEqual(try controller.loadDrawing(for: note).bounds, nonemptyDrawing(offset: 0).bounds)
         XCTAssertEqual(session.drawingDraft.bounds, nonemptyDrawing(offset: 200).bounds)
+        let draft = session.drawingDraft.dataRepresentation()
+        let metadata = BackupMetadata(noteRecords: [note])
+        var review = ReviewState()
+        review.begin()
+        review.revealNotes()
+        review.revealSummary()
+        review.end()
+        XCTAssertEqual(session.saveState, .saveFailed)
+        XCTAssertTrue(session.hasUnsavedChanges)
+        XCTAssertEqual(session.drawingDraft.dataRepresentation(), draft)
+        XCTAssertEqual(BackupMetadata(noteRecords: [note]), metadata)
     }
 
     func testBackupEnvelopeHasDeterministicCanonicalGoldenBytes() throws {

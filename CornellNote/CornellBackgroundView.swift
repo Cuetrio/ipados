@@ -1,5 +1,17 @@
 import UIKit
 
+struct CornellRegions {
+    let notes: CGRect
+    let summary: CGRect
+
+    init(size: CGSize) {
+        let left = min(size.width * 0.28, 260)
+        let top = size.height * 0.78
+        notes = CGRect(x: left, y: 0, width: size.width - left, height: top)
+        summary = CGRect(x: 0, y: top, width: size.width, height: size.height - top)
+    }
+}
+
 /// The fixed Cornell page drawn behind the ink. It is a plain UIView owned by the canvas,
 /// so it shares the canvas's lifetime and trait updates without a hosting controller.
 ///
@@ -54,8 +66,9 @@ final class CornellBackgroundView: UIView {
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        let leftColumn = min(bounds.width * 0.28, 260)
-        let summaryTop = bounds.height * 0.78
+        let regions = CornellRegions(size: bounds.size)
+        let leftColumn = regions.notes.minX
+        let summaryTop = regions.summary.minY
         columnLine.frame = CGRect(x: leftColumn - 0.5, y: 0, width: 1, height: summaryTop)
         summaryLine.frame = CGRect(x: 0, y: summaryTop - 0.5, width: bounds.width, height: 1)
 
