@@ -1,105 +1,166 @@
 import PencilKit
-import SwiftData
 import SwiftUI
 
-struct EditorView: View {
-    @Environment(\.modelContext) private var modelContext
-    @Environment(\.scenePhase) private var scenePhase
-    @Bindable var note: NoteRecord
-    @State private var canvasView = PKCanvasView()
-    @State private var selectedTool: PKTool = PKInkingTool(.pen, color: .label, width: 3)
-    @State private var saveTask: Task<Void, Never>?
-    @State private var saveState: NoteSaveState = .saved
+struct ReviewState {
+    private(set) var isActive = false
+    private(set) var notesCovered = false
+    private(set) var summaryCovered = false
 
-    private var persistence: NotePersistenceController {
-        NotePersistenceController(modelContext: modelContext)
+    mutating func begin() {
+        isActive = true
+        notesCovered = true
+        summaryCovered = true
+    }
+
+    mutating func end() { isActive = false }
+    mutating func revealNotes() { notesCovered = false }
+    mutating func revealSummary() { summaryCovered = false }
+}
+
+struct EditorView: View {
+    @Environment(\.scenePhase) private var scenePhase
+    let session: NoteEditingSession
+    let onLeave: () -> Void
+    @State private var canvasView = NoteCanvasView()
+    @State private var isShowingLeaveWarning = false
+    @State private var canUndo = false
+    @State private var canRedo = false
+    @State private var review = ReviewState()
+
+    private var isEditable: Bool { session.canEdit && !review.isActive }
+
+    static func statusLabel(saveState: NoteSaveState, hasLoadFailure: Bool) -> String? {
+        if hasLoadFailure { return "Read failed" }
+        return saveState == .saveFailed ? saveState.label : nil
     }
 
     var body: some View {
         VStack(spacing: 0) {
-            TextField("ノートのタイトル", text: $note.title)
+            TextField("ノートのタイトル", text: Binding(
+                get: { session.titleDraft },
+                set: { session.updateTitle($0) }
+            ))
                 .textFieldStyle(.roundedBorder)
                 .padding()
-                .onChange(of: note.title) { _, _ in
-                    markUnsavedAndSchedule()
-                }
+                .disabled(!isEditable)
 
-            GeometryReader { proxy in
-                ZStack {
-                    CornellBackgroundView()
-                    CanvasView(canvasView: $canvasView, selectedTool: selectedTool) { _ in
-                        markUnsavedAndSchedule()
+            if let message = session.loadFailureMessage {
+                ContentUnavailableView {
+                    Label("描画を読み込めません", systemImage: "exclamationmark.triangle")
+                } description: {
+                    Text(message)
+                } actions: {
+                    Button("再読み込み") {
+                        session.reload()
+                        showLoadedDrawing()
                     }
                 }
-                .padding()
-                .frame(width: proxy.size.width, height: proxy.size.height)
+            } else {
+                if let message = session.saveFailureMessage {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(message)
+                        Button("保存を再試行") { session.flushSave() }
+                    }
+                    .padding(.horizontal)
+                    .accessibilityElement(children: .contain)
+                }
+                if session.hasUnsavedChanges && session.saveState == .saveFailed {
+                    Text("未保存のタイトルと描画はメモリに保持しています。アプリの終了やOSによる強制終了の直前には保存を保証できず、失われる可能性があります。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal)
+                }
+
+                GeometryReader { proxy in
+                    // The canvas draws the Cornell background itself so it zooms with the ink.
+                    CanvasView(canvasView: canvasView, isEditable: isEditable, review: review,
+                               onRevealNotes: { review.revealNotes() },
+                               onRevealSummary: { review.revealSummary() }, onDrawingChanged: { drawing in
+                        session.updateDrawing(drawing)
+                        refreshHistoryState()
+                    }, onStrokeChanged: { session.setDrawingStrokeInProgress($0) })
+                    .padding()
+                    .frame(width: proxy.size.width, height: proxy.size.height)
+                }
             }
         }
-        .navigationTitle(note.displayTitle)
+        .navigationTitle(session.note.displayTitle)
         .navigationBarTitleDisplayMode(.inline)
+        .navigationBarBackButtonHidden(true)
+        .interactiveDismissDisabled(session.hasUnsavedChanges)
         .toolbar {
             ToolbarItemGroup(placement: .topBarLeading) {
-                Button("ペン") {
-                    selectedTool = PKInkingTool(.pen, color: .label, width: 3)
+                Button(action: requestLeave) {
+                    Label("ライブラリ", systemImage: "chevron.backward")
                 }
-                Button("消しゴム") {
-                    selectedTool = PKEraserTool(.vector)
+                Button {
+                    canvasView.undoManager?.undo()
+                    refreshHistoryState()
+                } label: {
+                    Label("取り消す", systemImage: "arrow.uturn.backward")
                 }
+                .disabled(!isEditable || !canUndo)
+                Button {
+                    canvasView.undoManager?.redo()
+                    refreshHistoryState()
+                } label: {
+                    Label("やり直す", systemImage: "arrow.uturn.forward")
+                }
+                .disabled(!isEditable || !canRedo)
             }
-            ToolbarItem(placement: .topBarTrailing) {
-                Text(saveState.label)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                Button(review.isActive ? "復習を終える" : "復習") {
+                    if review.isActive { review.end() } else { review.begin() }
+                }
+                .disabled(session.loadFailureMessage != nil)
+                Button("保存") { session.flushSave() }
+                    .disabled(!session.canEdit || !session.hasUnsavedChanges)
+                if let label = Self.statusLabel(saveState: session.saveState, hasLoadFailure: session.loadFailureMessage != nil) {
+                    Text(label)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
         }
-        .onAppear(perform: loadDrawing)
-        .onChange(of: scenePhase) { _, phase in
-            if phase == .background {
-                flushSave()
+        .alert("未保存の変更を破棄しますか？", isPresented: $isShowingLeaveWarning) {
+            Button("保存して戻る") {
+                if session.requestLeave() { onLeave() }
             }
+            Button("編集を続ける", role: .cancel) { session.cancelLeave() }
+            Button("変更を破棄して戻る", role: .destructive) {
+                if session.confirmDiscard() { onLeave() }
+            }
+        } message: {
+            Text("保存に失敗しました。戻ると未保存のタイトルと描画が失われます。端末の空き容量を確認して再試行するか、編集を続けてください。")
+        }
+        .onAppear(perform: showLoadedDrawing)
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .background { session.flushSave() }
         }
         .onDisappear {
-            flushSave()
-            saveTask?.cancel()
+            // Library retains the session if an unexpected navigation still leaves an unsaved draft.
+            session.flushSave()
         }
     }
 
-    private func loadDrawing() {
-        do {
-            canvasView.drawing = try persistence.loadDrawing(for: note)
-            saveState = .saved
-        } catch {
-            saveState = .saveFailed
-        }
+    /// Shows the persisted drawing; loading is not an edit, so the drawing history starts empty.
+    private func showLoadedDrawing() {
+        canvasView.drawing = session.drawingDraft
+        CanvasView.Coordinator.describeStrokes(of: canvasView)
+        canvasView.undoManager?.removeAllActions()
+        refreshHistoryState()
     }
 
-    private func markUnsavedAndSchedule() {
-        saveState = .unsavedChanges
-        saveTask?.cancel()
-        saveTask = Task { @MainActor in
-            do {
-                try await Task.sleep(nanoseconds: 450_000_000)
-                guard !Task.isCancelled else { return }
-                persistDrawing()
-            } catch {
-                // Cancellation is expected when another stroke arrives.
-            }
-        }
+    private func refreshHistoryState() {
+        canUndo = canvasView.undoManager?.canUndo ?? false
+        canRedo = canvasView.undoManager?.canRedo ?? false
     }
 
-    private func flushSave() {
-        saveTask?.cancel()
-        guard saveState == .unsavedChanges else { return }
-        persistDrawing()
-    }
-
-    private func persistDrawing() {
-        saveState = .saving
-        do {
-            try persistence.save(note: note, drawing: canvasView.drawing)
-            saveState = .saved
-        } catch {
-            saveState = .saveFailed
+    private func requestLeave() {
+        if session.requestLeave() {
+            onLeave()
+        } else {
+            isShowingLeaveWarning = true
         }
     }
 }

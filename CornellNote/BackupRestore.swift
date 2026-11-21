@@ -2,11 +2,8 @@ import Foundation
 import PencilKit
 import SwiftData
 
-extension Notification.Name {
-    static let cornellNoteStoreDidSwitch = Notification.Name("CornellNote.storeDidSwitch")
-}
-
 enum BackupRestoreError: Error, Equatable, LocalizedError {
+    case restoreUnavailable
     case capacityInsufficient
     case currentDataUnavailable
     case safetyBackupFailed
@@ -20,6 +17,7 @@ enum BackupRestoreError: Error, Equatable, LocalizedError {
 
     var errorDescription: String? {
         switch self {
+        case .restoreUnavailable: return "安全な復元の準備ができていないため、復元を一時停止しています。現在のノートは変更しません。"
         case .capacityInsufficient: return "Not enough local capacity for restore."
         case .currentDataUnavailable: return "Current local data could not be read."
         case .safetyBackupFailed: return "Safety backup could not be created."
@@ -31,118 +29,6 @@ enum BackupRestoreError: Error, Equatable, LocalizedError {
         case .markerWriteFailed: return "Restore recovery state could not be persisted."
         case .faultInjected(let name): return "Injected restore fault: \(name)."
         }
-    }
-}
-
-struct BackupExportResult {
-    let stagingURL: URL
-    let destinationURL: URL
-    let byteCount: UInt64
-    let sha256: String
-}
-
-@MainActor
-final class BackupExportCoordinator {
-    private let modelContext: ModelContext
-    private let fileSystem: BackupFileSystem
-    private let encoder: BackupEnvelopeEncoder
-    private let decoder: BackupEnvelopeDecoder
-    private let clock: BackupClock
-    private let uuidSource: BackupUUIDSource
-    private let provider: DocumentProviderAdapter
-
-    init(
-        modelContext: ModelContext,
-        fileSystem: BackupFileSystem,
-        encoder: BackupEnvelopeEncoder = BackupEnvelopeCodec(),
-        decoder: BackupEnvelopeDecoder = BackupEnvelopeCodec(),
-        clock: BackupClock = SystemBackupClock(),
-        uuidSource: BackupUUIDSource = SystemBackupUUIDSource(),
-        provider: DocumentProviderAdapter = LocalDocumentProviderAdapter()
-    ) {
-        self.modelContext = modelContext
-        self.fileSystem = fileSystem
-        self.encoder = encoder
-        self.decoder = decoder
-        self.clock = clock
-        self.uuidSource = uuidSource
-        self.provider = provider
-    }
-
-    func export(to destinationURL: URL, userConfirmedReplacement: Bool = false) throws -> BackupExportResult {
-        let staged = try makeVerifiedStagingFile()
-        do {
-            try provider.export(
-                sourceURL: staged.url,
-                destinationURL: destinationURL,
-                expectedSize: UInt64(staged.data.count),
-                expectedSHA256: staged.data.backupSHA256Hex,
-                userConfirmedReplacement: userConfirmedReplacement
-            )
-        } catch {
-            throw error
-        }
-        return BackupExportResult(
-            stagingURL: staged.url,
-            destinationURL: destinationURL,
-            byteCount: UInt64(staged.data.count),
-            sha256: staged.data.backupSHA256Hex
-        )
-    }
-
-    func makeVerifiedEnvelope() throws -> Data {
-        try makeVerifiedStagingFile().data
-    }
-
-    private func makeVerifiedStagingFile() throws -> (url: URL, data: Data) {
-        let notes: [NoteRecord]
-        do {
-            notes = try modelContext.fetch(FetchDescriptor<NoteRecord>())
-                .sorted { $0.id.uuidString.lowercased() < $1.id.uuidString.lowercased() }
-        } catch {
-            throw BackupRestoreError.currentDataUnavailable
-        }
-        let metadata = BackupMetadata(noteRecords: notes)
-        let drawings = try activeDrawingRecords(for: notes)
-        let data = try encoder.encode(
-            metadata: metadata,
-            drawings: drawings,
-            createdAtUnixNanos: BackupTimestamp.unixNanos(clock.now)
-        )
-
-        let directory = fileSystem.rootURL.appendingPathComponent(".backup-staging", isDirectory: true)
-        try fileSystem.createDirectory(at: directory)
-        let url = directory.appendingPathComponent("export-\(uuidSource.makeUUID().uuidString.lowercased()).cornellnote-backup")
-        try fileSystem.writeAndFlush(data, to: url)
-        let readBack = try fileSystem.readData(at: url)
-        guard readBack == data else { throw BackupRestoreError.stagingReadBackFailed }
-        _ = try decoder.decode(readBack)
-        return (url, readBack)
-    }
-
-    private func activeDrawingRecords(for notes: [NoteRecord]) throws -> [BackupDrawingRecord] {
-        var records: [BackupDrawingRecord] = []
-        for note in notes {
-            guard let localPath = note.drawingFileName, let checksum = note.drawingChecksum else { continue }
-            let envelopePath = BackupPathValidator.canonicalDrawingPath(localPath)
-            try BackupPathValidator.validate(envelopePath)
-            guard try BackupPathValidator.drawingNoteID(envelopePath) == note.id else {
-                throw BackupEnvelopeError.invalidPath(envelopePath)
-            }
-            guard try BackupPathValidator.drawingChecksum(envelopePath) == checksum else {
-                throw BackupEnvelopeError.invalidMetadata
-            }
-            let url = fileSystem.rootURL.appendingPathComponent(localPath)
-            let data = try fileSystem.readData(at: url)
-            guard data.backupSHA256Hex == checksum else {
-                throw BackupEnvelopeError.payloadHashMismatch(envelopePath)
-            }
-            guard (try? PKDrawing(data: data)) != nil else {
-                throw BackupEnvelopeError.invalidMetadata
-            }
-            records.append(BackupDrawingRecord(path: envelopePath, payload: data))
-        }
-        return records.sorted { $0.path < $1.path }
     }
 }
 
@@ -158,13 +44,15 @@ struct RestoreResult {
 final class BackupRestoreCoordinator {
     private let modelContext: ModelContext
     private let fileSystem: BackupFileSystem
+    private let managedFileSystem: BackupFileSystem
+    private let startup: NoteStartupController?
     private let encoder: BackupEnvelopeEncoder
     private let decoder: BackupEnvelopeDecoder
     private let clock: BackupClock
     private let uuidSource: BackupUUIDSource
     private let modelStoreSwitcher: BackupModelStoreSwitcher
     private let markerStore: RestoreMarkerStore
-    private let thumbnailRegenerator: BackupThumbnailRegenerator
+    private let thumbnailRegenerator: BackupThumbnailRegenerator?
     private let faultPlan: RestoreFaultPlan
 
     private(set) var state: RestoreState = .preparing
@@ -180,7 +68,8 @@ final class BackupRestoreCoordinator {
         modelStoreSwitcher: BackupModelStoreSwitcher? = nil,
         markerStore: RestoreMarkerStore? = nil,
         thumbnailRegenerator: BackupThumbnailRegenerator? = nil,
-        faultPlan: RestoreFaultPlan = RestoreFaultPlan()
+        faultPlan: RestoreFaultPlan = RestoreFaultPlan(),
+        startup: NoteStartupController? = nil
     ) {
         self.modelContext = modelContext
         self.fileSystem = fileSystem
@@ -188,20 +77,52 @@ final class BackupRestoreCoordinator {
         self.decoder = decoder
         self.clock = clock
         self.uuidSource = uuidSource
-        self.modelStoreSwitcher = modelStoreSwitcher ?? LocalBackupModelStoreSwitcher(fileSystem: fileSystem)
-        self.markerStore = markerStore ?? LocalRestoreMarkerStore(fileSystem: fileSystem)
-        self.thumbnailRegenerator = thumbnailRegenerator ?? LocalBackupThumbnailRegenerator(fileSystem: fileSystem)
+        self.startup = startup
+        let managedFileSystem = startup?.fileSystem ?? fileSystem
+        self.managedFileSystem = managedFileSystem
+        self.modelStoreSwitcher = modelStoreSwitcher ?? LocalBackupModelStoreSwitcher(
+            fileSystem: managedFileSystem, isAdmitted: { [weak startup] in startup?.isRestoring == true })
+        self.markerStore = markerStore ?? LocalRestoreMarkerStore(fileSystem: managedFileSystem)
+        self.thumbnailRegenerator = thumbnailRegenerator
         self.faultPlan = faultPlan
     }
 
     func restore(from data: Data) -> RestoreResult {
+        if let startup {
+            do {
+                guard case .ready(let generation) = startup.state,
+                      generation.fileSystem.rootURL == fileSystem.rootURL,
+                      generation.container === modelContext.container else {
+                    throw BackupRestoreError.restoreUnavailable
+                }
+                try startup.beginRestore()
+            } catch {
+                return RestoreResult(state: .restoreFailed, phase: .selected,
+                    errorDescription: error.localizedDescription, safetyBackupURL: nil, thumbnailRegenerated: false)
+            }
+        }
+        let result = performRestore(from: data)
+        startup?.finishRestore(recoveryRequired: result.state == .recoveryRequired)
+        if let startup, case .blocked(.recoveryRequired) = startup.state, result.state != .recoveryRequired {
+            state = .recoveryRequired
+            return RestoreResult(state: .recoveryRequired, phase: result.phase,
+                errorDescription: BackupRestoreError.markerWriteFailed.localizedDescription,
+                safetyBackupURL: result.safetyBackupURL, thumbnailRegenerated: result.thumbnailRegenerated)
+        }
+        return result
+    }
+
+    private func performRestore(from data: Data) -> RestoreResult {
         state = .preparing
         phase = .selected
+        if let refusal = restoreAdmissionFailure() { return refusal }
         var safetyBackupURL: URL?
         var stagingURL: URL?
+        var currentMetadata: BackupMetadata?
 
         do {
             let current = try currentSnapshot()
+            currentMetadata = current.metadata
             phase = .capacityPreflight
             try preflight(data: data, current: current)
 
@@ -246,6 +167,7 @@ final class BackupRestoreCoordinator {
                 try modelStoreSwitcher.atomicSwitch(to: stagingURL!)
                 if faultPlan.failPostSwitchReopen { throw BackupRestoreError.faultInjected("post-switch reopen") }
                 try modelStoreSwitcher.reopenCurrent(expectedMetadata: decoded.metadata)
+                try startup?.prepareRestoredGeneration()
                 phase = .postSwitchReopened
             } catch {
                 return handlePostSwitchFailure(
@@ -259,7 +181,9 @@ final class BackupRestoreCoordinator {
             var thumbnailRegenerated = false
             do {
                 if faultPlan.failThumbnailRegeneration { throw BackupRestoreError.faultInjected("thumbnail regeneration") }
-                try thumbnailRegenerator.regenerate(metadata: decoded.metadata, drawings: decoded.drawings)
+                let restoredFileSystem = try modelStoreSwitcher.restoredFileSystem(fallback: fileSystem)
+                let regenerator = thumbnailRegenerator ?? LocalBackupThumbnailRegenerator(fileSystem: restoredFileSystem)
+                try regenerator.regenerate(metadata: decoded.metadata, drawings: decoded.drawings)
                 thumbnailRegenerated = true
                 phase = .thumbnailRegenerated
             } catch {
@@ -268,10 +192,7 @@ final class BackupRestoreCoordinator {
 
             do {
                 if faultPlan.failMarkerWrite { throw BackupRestoreError.faultInjected("marker write") }
-                try markerStore.write(
-                    RestoreMarker(recoveryRequired: false, safetyBackupPath: nil, lastFailureState: nil),
-                    fallbackDirectory: nil
-                )
+                try resolveRecoveryMarker()
             } catch {
                 markRecoveryRequired(safetyBackupURL: safetyBackupURL, failureState: phase)
                 state = .recoveryRequired
@@ -296,6 +217,10 @@ final class BackupRestoreCoordinator {
                 thumbnailRegenerated: thumbnailRegenerated
             )
         } catch {
+            if let safetyBackupURL, let currentMetadata, modelStoreSwitcher.preservesStoreDirectories {
+                return handlePostSwitchFailure(error: error, currentMetadata: currentMetadata,
+                    safetyBackupURL: safetyBackupURL, stagingURL: stagingURL)
+            }
             cleanupStaging(stagingURL)
             state = .restoreFailed
             return RestoreResult(
@@ -309,12 +234,38 @@ final class BackupRestoreCoordinator {
     }
 
     func restore(from url: URL, provider: DocumentProviderAdapter) throws -> RestoreResult {
-        restore(from: try provider.readImportedFile(at: url))
+        if let startup {
+            guard startup.canRestore else {
+                return RestoreResult(state: .restoreFailed, phase: .selected,
+                    errorDescription: BackupRestoreError.restoreUnavailable.localizedDescription,
+                    safetyBackupURL: nil, thumbnailRegenerated: false)
+            }
+        } else if let refusal = restoreAdmissionFailure() { return refusal }
+        return restore(from: try provider.readImportedFile(at: url))
+    }
+
+    private func restoreAdmissionFailure() -> RestoreResult? {
+        do {
+            try modelStoreSwitcher.requireSafeRestoreAdmission()
+            return nil
+        } catch {
+            state = .restoreFailed
+            phase = .selected
+            return RestoreResult(
+                state: state,
+                phase: phase,
+                errorDescription: error.localizedDescription,
+                safetyBackupURL: nil,
+                thumbnailRegenerated: false
+            )
+        }
     }
 
     func recoveryMarker() -> RestoreMarker? {
         try? markerStore.read()
     }
+
+    static let capacityReserve: UInt64 = 1_048_576
 
     private func preflight(data: Data, current: CurrentSnapshot) throws {
         if faultPlan.failCapacityPreflight { throw BackupRestoreError.capacityInsufficient }
@@ -326,10 +277,15 @@ final class BackupRestoreCoordinator {
         let currentPayloadBytes = current.drawings.reduce(UInt64(0)) { partial, drawing in
             saturatingAdd(partial, UInt64(drawing.payload.count))
         }
-        let requiredWithReserve = saturatingAdd(
-            saturatingAdd(importedBytes, importedBytes),
-            saturatingAdd(currentPayloadBytes, 4_096)
-        )
+        let safetyEnvelope = try encoder.encode(metadata: current.metadata, drawings: current.drawings,
+            createdAtUnixNanos: BackupTimestamp.unixNanos(clock.now))
+        // Reserve the encoded safety snapshot and its separate drawing copies, incoming
+        // envelope/payloads, plus a conservative SQLite/WAL allowance and fixed headroom.
+        let incomingCopies = saturatingAdd(importedBytes, importedBytes)
+        let databaseAllowance = saturatingAdd(incomingCopies, incomingCopies)
+        let safetyBytes = saturatingAdd(UInt64(safetyEnvelope.count), currentPayloadBytes)
+        let requiredWithReserve = saturatingAdd(saturatingAdd(incomingCopies, databaseAllowance),
+            saturatingAdd(safetyBytes, Self.capacityReserve))
         let available = try fileSystem.availableCapacity(for: fileSystem.rootURL)
         guard available >= 0, UInt64(available) >= requiredWithReserve else {
             throw BackupRestoreError.capacityInsufficient
@@ -381,7 +337,7 @@ final class BackupRestoreCoordinator {
 
     private func createSafetyBackup(metadata: BackupMetadata, drawings: [BackupDrawingRecord]) throws -> URL {
         if faultPlan.failSafetyBackup { throw BackupRestoreError.safetyBackupFailed }
-        let url = BackupManagedPaths.safetyBackupURL(for: fileSystem, clock: clock, uuidSource: uuidSource)
+        let url = BackupManagedPaths.safetyBackupURL(for: managedFileSystem, clock: clock, uuidSource: uuidSource)
         do {
             try fileSystem.createDirectory(at: url)
             let envelope = try encoder.encode(
@@ -398,12 +354,21 @@ final class BackupRestoreCoordinator {
                     throw BackupRestoreError.safetyBackupFailed
                 }
             }
-            try copyCurrentStoreFiles(to: url)
             guard let readBack = try? fileSystem.readData(at: envelopeURL),
                   let decoded = try? decoder.decode(readBack),
                   decoded.metadata == metadata,
                   decoded.drawings == drawings else {
                 throw BackupRestoreError.safetyBackupFailed
+            }
+            if modelStoreSwitcher.preservesStoreDirectories {
+                // Durable pending intent precedes completion, so a later full-disk marker failure
+                // cannot make a restart mistake this restore for a completed operation.
+                let pending = try BackupCanonicalJSON.encode(recoveryMarker(for: url, failureState: .safetyBackupCreated))
+                let pendingURL = url.appendingPathComponent("recovery-state.json")
+                try fileSystem.writeAndFlush(pending, to: pendingURL)
+                guard try fileSystem.readData(at: pendingURL) == pending else {
+                    throw BackupRestoreError.safetyBackupFailed
+                }
             }
             let complete = Data("{\"completed\":true,\"schema\":1}".utf8)
             let completionURL = url.appendingPathComponent("safety-complete.json")
@@ -421,20 +386,9 @@ final class BackupRestoreCoordinator {
         }
     }
 
-    private func copyCurrentStoreFiles(to safetyURL: URL) throws {
-        let entries = try fileSystem.contentsOfDirectory(at: fileSystem.rootURL)
-        for entry in entries where entry.lastPathComponent == "metadata.store" || entry.lastPathComponent.hasPrefix("metadata.store-") {
-            let data = try fileSystem.readData(at: entry)
-            try fileSystem.writeAndFlush(data, to: safetyURL.appendingPathComponent(entry.lastPathComponent))
-            guard try fileSystem.readData(at: safetyURL.appendingPathComponent(entry.lastPathComponent)) == data else {
-                throw BackupRestoreError.safetyBackupFailed
-            }
-        }
-    }
-
     private func createStaging(envelopeData: Data, decoded: DecodedBackupEnvelope) throws -> URL {
-        let directory = BackupManagedPaths.stagingRoot(for: fileSystem)
-        let url = directory.appendingPathComponent("restore-\(uuidSource.makeUUID().uuidString.lowercased())", isDirectory: true)
+        let url = modelStoreSwitcher.stagingURL(id: uuidSource.makeUUID(), root: managedFileSystem.rootURL)
+        guard !fileSystem.fileExists(at: url) else { throw BackupRestoreError.stagingFailed }
         do {
             try fileSystem.createDirectory(at: url)
             try fileSystem.writeAndFlush(envelopeData, to: url.appendingPathComponent("restore-manifest.cornellnote-backup"))
@@ -442,10 +396,10 @@ final class BackupRestoreCoordinator {
             try modelStoreSwitcher.writeStagingStore(metadata: decoded.metadata, drawings: decoded.drawings, at: url)
             return url
         } catch let error as BackupRestoreError {
-            try? fileSystem.removeItem(at: url)
+            cleanupStaging(url)
             throw error
         } catch {
-            try? fileSystem.removeItem(at: url)
+            cleanupStaging(url)
             throw BackupRestoreError.stagingFailed
         }
     }
@@ -482,11 +436,9 @@ final class BackupRestoreCoordinator {
             if faultPlan.failRollback { throw BackupRestoreError.rollbackFailed }
             try modelStoreSwitcher.rollback(from: safetyBackupURL)
             try modelStoreSwitcher.reopenCurrent(expectedMetadata: currentMetadata)
+            try startup?.prepareRestoredGeneration()
             do {
-                try markerStore.write(
-                    RestoreMarker(recoveryRequired: false, safetyBackupPath: nil, lastFailureState: nil),
-                    fallbackDirectory: nil
-                )
+                try resolveRecoveryMarker()
             } catch {
                 markRecoveryRequired(safetyBackupURL: safetyBackupURL, failureState: phase)
                 state = .recoveryRequired
@@ -520,6 +472,12 @@ final class BackupRestoreCoordinator {
         }
     }
 
+    private func resolveRecoveryMarker() throws {
+        try markerStore.write(
+            RestoreMarker(recoveryRequired: false, safetyBackupPath: nil, lastFailureState: nil),
+            fallbackDirectory: nil)
+    }
+
     private func markRecoveryRequired(safetyBackupURL: URL?, failureState: RestorePhase) {
         guard let safetyBackupURL else { return }
         try? markerStore.write(
@@ -537,7 +495,8 @@ final class BackupRestoreCoordinator {
     }
 
     private func cleanupStaging(_ url: URL?) {
-        guard let url, BackupManagedPaths.isWithinManagedRoot(url, root: fileSystem.rootURL) else { return }
+        guard !modelStoreSwitcher.preservesStoreDirectories,
+              let url, BackupManagedPaths.isWithinManagedRoot(url, root: managedFileSystem.rootURL) else { return }
         try? fileSystem.removeItem(at: url)
         let parent = url.deletingLastPathComponent()
         if let remaining = try? fileSystem.contentsOfDirectory(at: parent), remaining.isEmpty {
@@ -546,7 +505,7 @@ final class BackupRestoreCoordinator {
     }
 
     private func cleanupSafetyBackups(protected: URL?) {
-        let root = BackupManagedPaths.safetyRoot(for: fileSystem)
+        let root = BackupManagedPaths.safetyRoot(for: managedFileSystem)
         guard let entries = try? fileSystem.contentsOfDirectory(at: root) else { return }
         let protectedPath = protected?.standardizedFileURL.path
         let complete = entries.filter { entry in
@@ -594,7 +553,7 @@ final class BackupRestoreCoordinator {
     }
 
     private func relativeManagedPath(_ url: URL) -> String {
-        let root = fileSystem.rootURL.standardizedFileURL.path
+        let root = managedFileSystem.rootURL.standardizedFileURL.path
         let path = url.standardizedFileURL.path
         return path == root ? "" : String(path.dropFirst(root.count + 1))
     }
@@ -603,96 +562,4 @@ final class BackupRestoreCoordinator {
 private struct CurrentSnapshot {
     let metadata: BackupMetadata
     let drawings: [BackupDrawingRecord]
-}
-
-@MainActor
-final class LocalBackupModelStoreSwitcher: BackupModelStoreSwitcher {
-    private let fileSystem: BackupFileSystem
-
-    init(fileSystem: BackupFileSystem) {
-        self.fileSystem = fileSystem
-    }
-
-    func writeStagingStore(metadata: BackupMetadata, drawings: [BackupDrawingRecord], at stagingURL: URL) throws {
-        let stagingFileSystem = LocalNoteFileSystem(rootURL: stagingURL)
-        try stagingFileSystem.createDirectory(at: stagingURL)
-        let container = try NotePersistenceController.makeContainer(fileSystem: stagingFileSystem)
-        let context = ModelContext(container)
-        for note in metadata.notes {
-            context.insert(note.makeNote())
-        }
-        try context.save()
-        for drawing in drawings {
-            try BackupPathValidator.validate(drawing.path)
-            let destination = stagingURL.appendingPathComponent(drawing.path)
-            try stagingFileSystem.writeAndFlush(drawing.payload, to: destination)
-            guard try stagingFileSystem.readData(at: destination).backupSHA256Hex == drawing.payload.backupSHA256Hex,
-                  (try? PKDrawing(data: drawing.payload)) != nil else {
-                throw BackupRestoreError.stagingFailed
-            }
-        }
-    }
-
-    func reopenStore(at rootURL: URL, expectedMetadata: BackupMetadata) throws {
-        let localFileSystem = LocalNoteFileSystem(rootURL: rootURL)
-        let container = try NotePersistenceController.makeContainer(fileSystem: localFileSystem)
-        let context = ModelContext(container)
-        let actual = BackupMetadata(noteRecords: try context.fetch(FetchDescriptor<NoteRecord>()))
-        guard actual == expectedMetadata else { throw BackupRestoreError.storeReopenFailed }
-        let controller = NotePersistenceController(modelContext: context, fileSystem: localFileSystem)
-        for note in try context.fetch(FetchDescriptor<NoteRecord>()) {
-            _ = try controller.loadDrawing(for: note)
-        }
-    }
-
-    func atomicSwitch(to stagingURL: URL) throws {
-        let previousURL = fileSystem.rootURL.appendingPathComponent(".restore-previous-\(UUID().uuidString)", isDirectory: true)
-        let failedURL = fileSystem.rootURL.appendingPathComponent(".restore-failed-\(UUID().uuidString)", isDirectory: true)
-        try fileSystem.createDirectory(at: previousURL)
-        do {
-            try moveActiveItems(from: fileSystem.rootURL, to: previousURL)
-            try moveActiveItems(from: stagingURL, to: fileSystem.rootURL)
-            try? fileSystem.removeItem(at: previousURL)
-        } catch {
-            do {
-                try fileSystem.createDirectory(at: failedURL)
-                try moveActiveItems(from: fileSystem.rootURL, to: failedURL)
-                try moveActiveItems(from: previousURL, to: fileSystem.rootURL)
-                try fileSystem.removeItem(at: previousURL)
-                try fileSystem.removeItem(at: failedURL)
-            } catch {
-                // The coordinator retains the safety backup and records recovery required.
-            }
-            throw BackupRestoreError.atomicSwitchFailed
-        }
-    }
-
-    func reopenCurrent(expectedMetadata: BackupMetadata) throws {
-        try reopenStore(at: fileSystem.rootURL, expectedMetadata: expectedMetadata)
-    }
-
-    func rollback(from safetyBackupURL: URL) throws {
-        let manifestURL = safetyBackupURL.appendingPathComponent("restore-manifest.cornellnote-backup")
-        let data = try fileSystem.readData(at: manifestURL)
-        let envelope = try BackupEnvelopeCodec().decode(data)
-        let rollbackURL = BackupManagedPaths.stagingRoot(for: fileSystem)
-            .appendingPathComponent("rollback-\(UUID().uuidString)", isDirectory: true)
-        do {
-            try writeStagingStore(metadata: envelope.metadata, drawings: envelope.drawings, at: rollbackURL)
-            try atomicSwitch(to: rollbackURL)
-            try? fileSystem.removeItem(at: rollbackURL)
-        } catch {
-            try? fileSystem.removeItem(at: rollbackURL)
-            throw BackupRestoreError.rollbackFailed
-        }
-    }
-
-    private func moveActiveItems(from source: URL, to destination: URL) throws {
-        let entries = try fileSystem.contentsOfDirectory(at: source)
-        for entry in entries {
-            let name = entry.lastPathComponent
-            guard name == "drawings" || name == "metadata.store" || name.hasPrefix("metadata.store-") else { continue }
-            try fileSystem.moveItem(at: entry, to: destination.appendingPathComponent(name, isDirectory: name == "drawings"))
-        }
-    }
 }

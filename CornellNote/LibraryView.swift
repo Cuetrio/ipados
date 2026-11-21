@@ -1,19 +1,29 @@
 import SwiftData
 import SwiftUI
 import UIKit
-import UniformTypeIdentifiers
 
 struct LibraryView: View {
     @Environment(\.modelContext) private var modelContext
+    @Environment(\.scenePhase) private var scenePhase
     @Query(sort: \NoteRecord.updatedAt, order: .reverse) private var notes: [NoteRecord]
     @State private var noteToDelete: NoteRecord?
-    @State private var isImportingBackup = false
-    @State private var isExportingBackup = false
-    @State private var backupDocument = CornellNoteBackupDocument(data: Data())
-    @State private var restoreState: RestoreState?
-    @State private var transferError: String?
+    @Binding var restoreState: RestoreState?
+    @Binding var isSettingsPresented: Bool
+    @State private var editingSession: NoteEditingSession?
+    @State private var isEditorPresented = false
+    @State private var isNewEditingSession = false
+    @State private var capacity: Int64?
+    @State private var operationError: String?
 
-    init() {}
+    private var isLowCapacity: Bool { LibraryBackupActions.isLowCapacity(capacity) }
+
+    private var hasRetainedDraft: Bool {
+        editingSession?.hasUnsavedChanges == true
+    }
+
+    let fileSystem: BackupFileSystem
+    let writeAdmission: NoteWriteAdmission
+    let startup: NoteStartupController
 
     var body: some View {
         NavigationStack {
@@ -21,46 +31,70 @@ struct LibraryView: View {
                 if notes.isEmpty {
                     ContentUnavailableView("ノートはありません", systemImage: "note.text")
                 }
+                if isLowCapacity {
+                    Text("空き容量が100 MB未満のため、新規ノートを作成できません。容量を確保してください。")
+                }
+                if hasRetainedDraft {
+                    Button("未保存の変更があります。編集に戻って保存または破棄してください。") {
+                        isEditorPresented = true
+                    }
+                }
                 ForEach(notes) { note in
-                    NavigationLink {
-                        EditorView(note: note)
+                    Button {
+                        openNote(note)
                     } label: {
                         VStack(alignment: .leading, spacing: 4) {
                             HStack(spacing: 12) {
-                                NoteThumbnailView(note: note)
+                                NoteThumbnailView(note: note, fileSystem: fileSystem, writeAdmission: writeAdmission)
                                 VStack(alignment: .leading, spacing: 4) {
                                     Text(note.displayTitle)
                                         .font(.headline)
-                                    Text(note.updatedAt, style: .date)
+                                    Text(Self.japaneseDate(note.updatedAt))
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }
                             }
                         }
                     }
+                    .disabled(hasRetainedDraft && editingSession?.note.id != note.id)
                     .swipeActions {
                         Button(role: .destructive) {
                             noteToDelete = note
                         } label: {
                             Label("削除", systemImage: "trash")
                         }
+                        .disabled(hasRetainedDraft)
                     }
                 }
             }
-            .navigationTitle("Cornell Note")
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Menu {
-                        Button("バックアップを書き出す", action: beginBackupExport)
-                        Button("バックアップを読み込む", action: { isImportingBackup = true })
-                    } label: {
-                        Label("バックアップ", systemImage: "externaldrive")
+            .navigationDestination(isPresented: $isEditorPresented) {
+                if let editingSession {
+                    EditorView(session: editingSession) {
+                        if isNewEditingSession, editingSession.canEdit,
+                           editingSession.titleDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                           editingSession.drawingDraft.strokes.isEmpty {
+                            deleteNote(editingSession.note)
+                        }
+                        isEditorPresented = false
+                        self.editingSession = nil
+                        isNewEditingSession = false
                     }
                 }
+            }
+            .onChange(of: isEditorPresented) { _, isPresented in
+                if !isPresented {
+                    editingSession?.flushSave()
+                }
+            }
+            .onChange(of: scenePhase) { _, phase in
+                if phase == .background && !isEditorPresented { editingSession?.flushSave() }
+            }
+            .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button(action: createNote) {
                         Label("新規ノート", systemImage: "plus")
                     }
+                    .disabled(hasRetainedDraft || isLowCapacity)
                 }
             }
             .alert("ノートを削除しますか？", isPresented: Binding(
@@ -72,41 +106,35 @@ struct LibraryView: View {
             } message: {
                 Text("削除したノートは元に戻せません。")
             }
-            .alert("バックアップ処理に失敗しました", isPresented: Binding(
-                get: { transferError != nil },
-                set: { if !$0 { transferError = nil } }
+            .alert("操作に失敗しました", isPresented: Binding(
+                get: { operationError != nil },
+                set: { if !$0 { operationError = nil } }
             )) {
-                Button("閉じる", role: .cancel) { transferError = nil }
+                Button("閉じる", role: .cancel) { operationError = nil }
             } message: {
-                Text(transferError ?? "")
-            }
-            .fileImporter(
-                isPresented: $isImportingBackup,
-                allowedContentTypes: [.data],
-                allowsMultipleSelection: false,
-                onCompletion: importBackup
-            )
-            .fileExporter(
-                isPresented: $isExportingBackup,
-                document: backupDocument,
-                contentType: .data,
-                defaultFilename: "CornellNote-backup.cornellnote-backup",
-                onCompletion: exportCompleted
-            )
-            .overlay(alignment: .bottom) {
-                if let restoreState {
-                    Text(restoreState.localizedLabel)
-                        .font(.caption)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 8)
-                        .background(.regularMaterial, in: Capsule())
-                        .padding(.bottom, 8)
-                }
+                Text(operationError ?? "")
             }
             .task {
-                let persistence = NotePersistenceController(modelContext: modelContext)
+                while !Task.isCancelled {
+                    refreshCapacity()
+                    try? await Task.sleep(for: .seconds(2))
+                }
+            }
+            .modifier(LibraryBackupActions(
+                fileSystem: fileSystem,
+                writeAdmission: writeAdmission,
+                startup: startup,
+                hasRetainedDraft: hasRetainedDraft,
+                saveState: editingSession?.saveState ?? .saved,
+                lastSaved: notes.first?.updatedAt,
+                restoreState: $restoreState,
+                isSettingsPresented: $isSettingsPresented
+            ))
+            .task {
+                guard writeAdmission.isAllowed else { return }
+                let persistence = NotePersistenceController(modelContext: modelContext, fileSystem: fileSystem, canWrite: { [writeAdmission] in writeAdmission.isAllowed })
                 notes.forEach { persistence.cleanupOrphans(for: $0) }
-                let coordinator = BackupRestoreCoordinator(modelContext: modelContext, fileSystem: LocalNoteFileSystem())
+                let coordinator = BackupRestoreCoordinator(modelContext: modelContext, fileSystem: fileSystem)
                 if coordinator.recoveryMarker()?.recoveryRequired == true {
                     restoreState = .recoveryRequired
                 }
@@ -114,94 +142,73 @@ struct LibraryView: View {
         }
     }
 
-    private func beginBackupExport() {
+    private func openNote(_ note: NoteRecord, isNew: Bool = false) {
+        guard writeAdmission.isAllowed else { return }
+        if !hasRetainedDraft {
+            isNewEditingSession = isNew
+            editingSession = NoteEditingSession(
+                note: note,
+                persistence: NotePersistenceController(modelContext: modelContext, fileSystem: fileSystem, canWrite: { [writeAdmission] in writeAdmission.isAllowed }),
+                canWrite: { [writeAdmission] in writeAdmission.isAllowed }
+            )
+            if let editingSession { writeAdmission.register(editingSession) }
+        }
+        isEditorPresented = true
+    }
+
+    private func refreshCapacity() {
+        capacity = LibraryBackupActions.availableCapacity(at: fileSystem.rootURL)
+    }
+
+    static func japaneseDate(_ date: Date, includeTime: Bool = false) -> String {
+        let style = Date.FormatStyle(date: .abbreviated, time: includeTime ? .shortened : .omitted)
+            .locale(Locale(identifier: "ja_JP"))
+        return date.formatted(style)
+    }
+
+    static func createNote(in context: ModelContext, note: NoteRecord = NoteRecord(), save: () throws -> Void) -> Bool {
+        context.insert(note)
         do {
-            let coordinator = BackupExportCoordinator(modelContext: modelContext, fileSystem: LocalNoteFileSystem())
-            backupDocument = CornellNoteBackupDocument(data: try coordinator.makeVerifiedEnvelope())
-            isExportingBackup = true
+            try save()
+            return true
         } catch {
-            transferError = error.localizedDescription
+            context.delete(note)
+            return false
         }
     }
 
-    private func importBackup(_ result: Result<[URL], Error>) {
-        guard let url = try? result.get().first else {
-            if case .failure(let error) = result { transferError = error.localizedDescription }
-            return
-        }
-        let didStartAccessing = url.startAccessingSecurityScopedResource()
-        defer { if didStartAccessing { url.stopAccessingSecurityScopedResource() } }
-        let coordinator = BackupRestoreCoordinator(modelContext: modelContext, fileSystem: LocalNoteFileSystem())
-        let restoreResult = try? coordinator.restore(from: url, provider: LocalDocumentProviderAdapter())
-        restoreState = restoreResult?.state ?? .restoreFailed
-        if restoreResult?.state == .completed {
-            NotificationCenter.default.post(name: .cornellNoteStoreDidSwitch, object: nil)
-        }
-        if restoreResult == nil { transferError = "バックアップを読み込めませんでした。" }
-    }
-
-    private func exportCompleted(_ result: Result<URL, Error>) {
-        switch result {
-        case .failure(let error):
-            transferError = error.localizedDescription
-        case .success(let url):
-            guard let data = try? Data(contentsOf: url),
-                  data == backupDocument.data,
-                  data.backupSHA256Hex == backupDocument.data.backupSHA256Hex else {
-                transferError = "書き出し先のバックアップを検証できませんでした。"
-                return
-            }
+    static func performDelete(_ delete: () throws -> Void) -> Bool {
+        do {
+            try delete()
+            return true
+        } catch {
+            return false
         }
     }
 
     private func createNote() {
+        refreshCapacity()
+        guard writeAdmission.isAllowed, !hasRetainedDraft, !isLowCapacity else { return }
         let note = NoteRecord()
-        modelContext.insert(note)
-        do {
-            try modelContext.save()
-        } catch {
-            modelContext.delete(note)
+        if Self.createNote(in: modelContext, note: note, save: { try modelContext.save() }) {
+            openNote(note, isNew: true)
+        } else {
+            operationError = "ノートを作成できませんでした。空き容量を確認してください。"
         }
     }
 
     private func deleteSelectedNote() {
         guard let note = noteToDelete else { return }
-        do {
-            try NotePersistenceController(modelContext: modelContext).delete(note: note)
-        } catch {
-            noteToDelete = nil
-        }
-    }
-}
-
-private struct CornellNoteBackupDocument: FileDocument {
-    static var readableContentTypes: [UTType] { [.data] }
-    static var writableContentTypes: [UTType] { [.data] }
-
-    let data: Data
-
-    init(data: Data) {
-        self.data = data
+        noteToDelete = nil
+        guard writeAdmission.isAllowed, !hasRetainedDraft else { return }
+        deleteNote(note)
     }
 
-    init(configuration: ReadConfiguration) throws {
-        data = configuration.file.regularFileContents ?? Data()
-    }
-
-    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
-        FileWrapper(regularFileWithContents: data)
-    }
-}
-
-private extension RestoreState {
-    var localizedLabel: String {
-        switch self {
-        case .preparing: return "準備中"
-        case .validating: return "検証中"
-        case .restoring: return "復元中"
-        case .completed: return "復元完了"
-        case .restoreFailed: return "復元に失敗しました"
-        case .recoveryRequired: return "復旧が必要です"
+    private func deleteNote(_ note: NoteRecord) {
+        if !Self.performDelete({
+            try NotePersistenceController(modelContext: modelContext, fileSystem: fileSystem, canWrite: { [writeAdmission] in writeAdmission.isAllowed }).delete(note: note)
+        }) {
+            operationError = "ノートを削除できませんでした。もう一度お試しください。"
         }
     }
 }
@@ -209,6 +216,8 @@ private extension RestoreState {
 private struct NoteThumbnailView: View {
     @Environment(\.modelContext) private var modelContext
     let note: NoteRecord
+    let fileSystem: BackupFileSystem
+    let writeAdmission: NoteWriteAdmission
     @State private var image: UIImage?
 
     var body: some View {
@@ -225,18 +234,13 @@ private struct NoteThumbnailView: View {
         }
         .frame(width: 72, height: 54)
         .clipShape(RoundedRectangle(cornerRadius: 6))
-        .task { loadThumbnail() }
+        .task(id: NotePersistenceController.thumbnailKey(for: note)) { loadThumbnail() }
     }
 
     private func loadThumbnail() {
-        let persistence = NotePersistenceController(modelContext: modelContext)
-        if let data = try? persistence.thumbnailData(for: note), let cached = UIImage(data: data) {
-            image = cached
-            return
-        }
-        guard let drawing = try? persistence.loadDrawing(for: note),
-              let url = try? persistence.regenerateThumbnail(for: note, drawing: drawing),
-              let data = try? Data(contentsOf: url) else { return }
-        image = UIImage(data: data)
+        image = nil
+        guard writeAdmission.isAllowed else { return }
+        let persistence = NotePersistenceController(modelContext: modelContext, fileSystem: fileSystem, canWrite: { [writeAdmission] in writeAdmission.isAllowed })
+        image = persistence.thumbnailImage(for: note)
     }
 }
